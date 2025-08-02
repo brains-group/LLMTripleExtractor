@@ -8,6 +8,7 @@ from collections import defaultdict
 import os
 import torch
 import sys
+import statistics
 
 from tqdm import tqdm
 import datasets
@@ -159,14 +160,16 @@ def createShots(shots):
 parser = argparse.ArgumentParser()
 parser.add_argument("--base_model_path", type=str, default="Qwen/Qwen3-0.6B")
 parser.add_argument("--num_test_points", type=int, default=100)
+parser.add_argument("--do_not_load_model", action=argparse.BooleanOptionalAction)
 args = parser.parse_args()
 print(args)
 
 # ============= Generate responses =============
-device = "cuda"
-model = AutoModelForCausalLM.from_pretrained(
-    args.base_model_path, torch_dtype=torch.float16
-).to(device)
+if not args.do_not_load_model:
+    device = "cuda"
+    model = AutoModelForCausalLM.from_pretrained(
+        args.base_model_path, torch_dtype=torch.float16
+    ).to(device)
 tokenizer = AutoTokenizer.from_pretrained(args.base_model_path, use_fast=False)
 
 
@@ -323,11 +326,23 @@ def runTests(dataset, shots=[], name=None):
         "{hits}"
     ).format(
         num_tests=numDatapoints,
-        precision=getSumOfDictVals(truePositives)
-        / (getSumOfDictVals(truePositives) + getSumOfDictVals(falsePositives)),
-        recall=getSumOfDictVals(truePositives)
-        / (getSumOfDictVals(truePositives) + getSumOfDictVals(falseNegatives)),
-        mrr=getSumOfDictVals(mrr) / numDatapoints,
+        precision=(
+            str(
+                prec := getSumOfDictVals(truePositives)
+                / (getSumOfDictVals(truePositives) + getSumOfDictVals(falsePositives))
+            )
+        )
+        + " - "
+        + str(math.sqrt(prec * (1 - prec) / numDatapoints)),
+        recall=str(
+            rec := getSumOfDictVals(truePositives)
+            / (getSumOfDictVals(truePositives) + getSumOfDictVals(falseNegatives))
+        )
+        + " - "
+        + str(math.sqrt(rec * (1 - rec) / numDatapoints)),
+        mrr=str(motor := getSumOfDictVals(mrr) / numDatapoints)
+        + " - "
+        + str(math.sqrt(motor * (1 - motor) / numDatapoints)),
         hits="\n".join(
             [
                 "Hits@{}: {} - {}".format(
@@ -361,10 +376,10 @@ testSet = movieDataset[numShots : (numShots + args.num_test_points)]
 print("Performing 0-Shot Test:")
 print(f"0-Shot Scores: {runTests(testSet)}")
 print("Performing 1-Shot Test:")
-print(f"0-Shot Scores: {runTests(testSet, shots[:1])}")
+print(f"1-Shot Scores: {runTests(testSet, shots[:1])}")
 print("Performing 3-Shot Test:")
-print(f"0-Shot Scores: {runTests(testSet, shots[:3])}")
+print(f"3-Shot Scores: {runTests(testSet, shots[:3])}")
 print("Performing 5-Shot Test:")
-print(f"0-Shot Scores: {runTests(testSet, shots[:5])}")
+print(f"5-Shot Scores: {runTests(testSet, shots[:5])}")
 print("Performing 10-Shot Test:")
-print(f"0-Shot Scores: {runTests(testSet, shots[:10])}")
+print(f"10-Shot Scores: {runTests(testSet, shots[:10])}")
