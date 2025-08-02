@@ -227,15 +227,17 @@ def runTests(dataset, shots=[], name=None):
         else:
             response = responses[index]
         print(f"---------------- RESPONSE --------------\n{response}")
-        endThinkString = "</think>"
-        endThinkIndex = response.rfind(endThinkString)
-        if endThinkIndex == -1:
-            print("Output did not complete thinking.")
-            continue
+        if "Qwen" in args.base_model_path:
+            endThinkString = "</think>"
+            endThinkIndex = response.rfind(endThinkString)
+            if endThinkIndex == -1:
+                print("Output did not complete thinking.")
+                continue
         if len(tokenizer.encode(response, add_special_tokens=True)) > 4090:
-            print("Output did not complete after thinking.")
+            print("Output did not complete.")
             continue
-        response = response[(endThinkIndex + len(endThinkString)) :]
+        if "Qwen" in args.base_model_path:
+            response = response[(endThinkIndex + len(endThinkString)) :]
 
         goals = getTriples(dataPoint)
         print(f"---------------- GOALS --------------\n{goals}")
