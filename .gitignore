@@ -1,0 +1,8 @@
+/data/*.json*
+/models
+__pycache__
+/outputs
+movieKnowledgeGraphDataset/
+/data/*/*.json*
+responses/
+*.out
