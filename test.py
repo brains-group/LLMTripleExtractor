@@ -159,7 +159,7 @@ def createShots(shots):
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--base_model_path", type=str, default="Qwen/Qwen3-0.6B")
-parser.add_argument("--num_test_points", type=int, default=100)
+parser.add_argument("--num_test_points", type=int, default=300)
 parser.add_argument("--do_not_load_model", action=argparse.BooleanOptionalAction)
 args = parser.parse_args()
 print(args)
@@ -195,7 +195,7 @@ def runTests(dataset, shots=[], name=None):
     mrr = defaultdict(int)
     numDatapoints = 0
     for index, dataPoint in enumerate(tqdm(dataset)):
-        if saveResponses:
+        if saveResponses or  index >= len(responses):
             text = tokenizer.apply_chat_template(
                 [
                     {
@@ -296,6 +296,7 @@ def runTests(dataset, shots=[], name=None):
         falseNegatives[index] = max(
             0, min(20 - truePositives[index], falseNegatives[index])
         )
+        mrr[index] = 0
         if rank >= 0:
             mrr[index] += 1 / (rank + 1)
             if len(hits[index]) < len(recommendations):
@@ -340,9 +341,9 @@ def runTests(dataset, shots=[], name=None):
         )
         + " - "
         + str(math.sqrt(rec * (1 - rec) / numDatapoints)),
-        mrr=str(motor := getSumOfDictVals(mrr) / numDatapoints)
+        mrr=str(getSumOfDictVals(mrr) / numDatapoints)
         + " - "
-        + str(math.sqrt(motor * (1 - motor) / numDatapoints)),
+        + str(statistics.stdev(mrr.values())),
         hits="\n".join(
             [
                 "Hits@{}: {} - {}".format(
