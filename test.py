@@ -61,9 +61,7 @@ The triples must strictly follow the format: (User, [Relation], [Object])
 
 TRIPLE_FORMAT = "({}, {}, {})"
 
-SHOT_TEMPLATE = """---
-
-### Example Task
+SHOT_TEMPLATE = """### Example Task
 
 **Input Conversation:**
 ```json
@@ -71,9 +69,7 @@ SHOT_TEMPLATE = """---
 ```
 
 **Correct Output:**
-{}
-
----"""
+{}"""
 
 
 def messagesToConversation(datapoint):
