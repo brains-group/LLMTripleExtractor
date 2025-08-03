@@ -195,7 +195,8 @@ def runTests(dataset, shots=[], name=None):
     mrr = defaultdict(int)
     numDatapoints = 0
     for index, dataPoint in enumerate(tqdm(dataset)):
-        if saveResponses or  index >= len(responses):
+        if saveResponses or index >= len(responses):
+            saveResponses = True
             text = tokenizer.apply_chat_template(
                 [
                     {
