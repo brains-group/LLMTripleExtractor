@@ -16,42 +16,40 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 random.seed(2025)
+"""
+CHANGES: 
 
-# PROMPT = '''You will analyze the following conversation to extract triples about the user for a personal knowledge graph about them.
+I have added logic to test.py to save recommendations to a directory for later use. 
 
-# ```json
-# {}
-# ```
+There is added logic in test.py currently to only save 5 shot versions of recommendations (the triplets).
 
-# The triples should be in the following format:
-# (User, [Relation], [Object])
+Prompt has additions for relations, their definitions, and a blank spot for the schema.
 
-# These are the following relations to consider:
-# Likes: Indicates that the user likes the object
-# Dislikes: Indicates that the user dislikes the object
-# Seen: Indicates that the user has seen the object
-# Unseen: Indicates that the user has not seen the object
-# Suggested: Indicates that the object has been recommended to the user
-# '''
 
-PROMPT = """You are a highly precise information extraction engine. Your task is to analyze the following conversation and extract triples about the user's relationship with movies for a personal knowledge graph.
+"""
+PROMPT = """You are a highly precise information extraction engine. Your task is to analyze the following conversation and extract triples about the user's relationships and preferences for a personal knowledge graph.
 
 The triples must strictly follow the format: (User, [Relation], [Object])
 
 ### Allowed Relations:
-- Likes: The user explicitly states a positive preference for a movie or movie genre.
-- Dislikes: The user explicitly states a negative preference for a movie or movie genre.
-- Seen: The user explicitly states they have watched the movie.
-- Unseen: The user explicitly states they have NOT watched the movie.
-- Suggested: A movie is recommended to the user by the assistant.
+- Likes: The user explicitly states a positive preference, enjoyment, or favorable opinion about something.
+- Dislikes: The user explicitly states a negative preference, dislike, or unfavorable opinion about something.
+- Seen: The user explicitly states they have experienced, watched, read, visited, or encountered the object.
+- notSeen: The user explicitly states they have NOT experienced, watched, read, visited, or encountered the object.
+- wasSuggested: An item, activity, or topic is recommended to the user by the assistant.
 
 ### Rules:
-1. The `[Object]` of the triple must be the title of a specific movie or a genre of movies. Do not extract other types of objects like actors, directors, or general topics.
-2. The `[Object]` should be as specific as possible (include the whole name).
+1. The `[Object]` can be any entity, item, topic, activity, place, or concept discussed in the conversation (e.g., movies, books, restaurants, hobbies, products, places, etc.).
+2. The `[Object]` should be as specific as possible (include the complete name or detailed description).
 3. If no relevant triples can be extracted from the conversation, output the text: "No triples found."
 4. Focus only on triples where the user is the subject.
 5. Provide triples for all applicable relations.
+6. Extract triples for any domain or topic - not limited to a specific category.
 {}
+
+### Schema:
+{}
+
 ### Your Task
 
 **Input Conversation:**
@@ -153,6 +151,22 @@ def createShots(shots):
     return "\n---\n\n" + "".join([(createShot(shot) + "\n\n---\n") for shot in shots])
 
 
+def extractTriplesFromResponse(response):
+    """Extract triples from model response and return as list of tuples"""
+    recommendations = re.findall(r"\([^,]+, [^,]+, [^\)]+\)?\)", response)
+    extracted = []
+    
+    for rec in recommendations:
+        # Parse the triple string into components
+        # Remove parentheses and split by comma
+        rec_clean = rec.strip("()")
+        parts = [p.strip() for p in rec_clean.split(",")]
+        if len(parts) == 3:
+            extracted.append(tuple(parts))
+    
+    return extracted
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--base_model_path", type=str, default="Qwen/Qwen3-0.6B")
 parser.add_argument("--num_test_points", type=int, default=300)
@@ -169,11 +183,28 @@ if not args.do_not_load_model:
 tokenizer = AutoTokenizer.from_pretrained(args.base_model_path, use_fast=False)
 
 
-def runTests(dataset, shots=[], name=None):
+def runTests(dataset, shots=[], name=None, num_shots=0):
     if name is None:
         name = args.base_model_path + "_" + str(len(shots)) + "shot"
     responses = []
     responsesPath = "responses/" + name + ".json"
+    
+    # Create recommendations directory if it doesn't exist
+    recommendationsDir = "recommendations"
+    if not os.path.exists(recommendationsDir):
+        os.makedirs(recommendationsDir)
+    
+    # Create original_snippets directory if it doesn't exist
+    originalSnippetsDir = "original_snippets"
+    if not os.path.exists(originalSnippetsDir):
+        os.makedirs(originalSnippetsDir)
+    
+    # Path for saving extracted triples
+    recommendationsPath = os.path.join(recommendationsDir, f"{num_shots}shots.json")
+    
+    # Path for saving original conversation snippet
+    snippetPath = os.path.join(originalSnippetsDir, f"original_ReDial_snippet_{num_shots}shots.json")
+    
     saveResponses = True
     if os.path.exists(responsesPath):
         with open(responsesPath, "r") as file:
@@ -190,14 +221,22 @@ def runTests(dataset, shots=[], name=None):
     hits = defaultdict(lambda: [0 for _ in range(10)])
     mrr = defaultdict(int)
     numDatapoints = 0
+    
+    # Store extracted triples and conversations for ALL datapoints
+    all_extracted_triples_per_conversation = {}
+    all_conversations = {}
+    
     for index, dataPoint in enumerate(tqdm(dataset)):
+        # Save all conversations
+        all_conversations[index] = dataPoint
+        
         if saveResponses or index >= len(responses):
             saveResponses = True
             text = tokenizer.apply_chat_template(
                 [
                     {
                         "content": PROMPT.format(
-                            createShots(shots), messagesToConversation(dataPoint)
+                            createShots(shots), "", messagesToConversation(dataPoint)
                         ),
                         "role": "user",
                     }
@@ -241,6 +280,11 @@ def runTests(dataset, shots=[], name=None):
 
         goals = getTriples(dataPoint)
         print(f"---------------- GOALS --------------\n{goals}")
+
+        # Extract triples from response for datapoints
+        extracted_triples = extractTriplesFromResponse(response)
+        all_extracted_triples_per_conversation[index] = extracted_triples
+        print(f"---------------- EXTRACTED TRIPLES --------------\n{extracted_triples}")
 
         recommendations = re.findall(r"\([^,]+, [^,]+, [^\)]+\)?\)", response)
         formatFollowed = len(recommendations) > 0
@@ -311,7 +355,37 @@ def runTests(dataset, shots=[], name=None):
     if saveResponses:
         with open(responsesPath, "w") as file:
             json.dump(responses, file)
-
+ # ========REMOVE THIS LATER=====================================================================================   
+    # Only save files for 5-shot configuration
+    if num_shots == 5:
+        print(f"\nSaving {len(all_conversations)} conversations and their extracted triples...")
+        
+        for conv_index in all_conversations.keys():
+            # Save each conversation to original_snippets
+            snippet_filename = f"original_ReDial_snippet_{num_shots}shots_{conv_index}.json"
+            snippet_path_indexed = os.path.join(originalSnippetsDir, snippet_filename)
+            
+            with open(snippet_path_indexed, "w", encoding="utf-8") as file:
+                json.dump([all_conversations[conv_index]], file, indent=2, ensure_ascii=False)
+            
+            # Save extracted triples for this conversation
+            recommendations_filename = f"{num_shots}shots_{conv_index}.json"
+            recommendations_path_indexed = os.path.join(recommendationsDir, recommendations_filename)
+            
+            triples_as_strings = [
+                f"({triple[0]}, {triple[1]}, {triple[2]})" 
+                for triple in all_extracted_triples_per_conversation[conv_index]
+            ]
+            
+            with open(recommendations_path_indexed, "w") as file:
+                json.dump(triples_as_strings, file, indent=2)
+            
+            print(f"  Saved conversation {conv_index}: {len(triples_as_strings)} triples")
+        
+        print(f"Finished saving all {len(all_conversations)} conversations for {num_shots}-shot")
+    else:
+        print(f"Skipping file save for {num_shots}-shot (only saving 5-shot)")
+#=========================================================================================================================
     def getSumOfDictVals(dictionary):
         return sum(dictionary.values())
 
@@ -340,7 +414,7 @@ def runTests(dataset, shots=[], name=None):
         + str(math.sqrt(rec * (1 - rec) / numDatapoints)),
         mrr=str(getSumOfDictVals(mrr) / numDatapoints)
         + " - "
-        + str(statistics.stdev(mrr.values())),
+        + str(statistics.stdev(mrr.values()) if numDatapoints > 1 else 0),
         hits="\n".join(
             [
                 "Hits@{}: {} - {}".format(
@@ -372,12 +446,12 @@ shots = movieDataset[:numShots]
 testSet = movieDataset[numShots : (numShots + args.num_test_points)]
 
 print("Performing 0-Shot Test:")
-print(f"0-Shot Scores: {runTests(testSet)}")
+print(f"0-Shot Scores: {runTests(testSet, num_shots=0)}")
 print("Performing 1-Shot Test:")
-print(f"1-Shot Scores: {runTests(testSet, shots[:1])}")
+print(f"1-Shot Scores: {runTests(testSet, shots[:1], num_shots=1)}")
 print("Performing 3-Shot Test:")
-print(f"3-Shot Scores: {runTests(testSet, shots[:3])}")
+print(f"3-Shot Scores: {runTests(testSet, shots[:3], num_shots=3)}")
 print("Performing 5-Shot Test:")
-print(f"5-Shot Scores: {runTests(testSet, shots[:5])}")
+print(f"5-Shot Scores: {runTests(testSet, shots[:5], num_shots=5)}")
 print("Performing 10-Shot Test:")
-print(f"10-Shot Scores: {runTests(testSet, shots[:10])}")
+print(f"10-Shot Scores: {runTests(testSet, shots[:10], num_shots=10)}")
