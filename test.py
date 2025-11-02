@@ -535,6 +535,11 @@ if __name__ == "__main__":
         processor = AugmentDataset()
         processor.load_conversation_from_snippet(snippet_path)
         processor.load_triples_from_file(rec_path)
+
+        if not processor.extracted_triples:
+            print(f"Skipping {base_name}: no triples found.")
+            continue
+
         processor.update_conversation()
 
         updated_path = os.path.join(AUGMENTED_DIR, f"updated_ReDial_from_{base_name}.json")
