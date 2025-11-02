@@ -366,26 +366,25 @@ def runTests(dataset, shots=[], name=None, num_shots=0):
         print(f"\nSaving {len(all_conversations)} conversations and their extracted triples...")
         
         for conv_index in all_conversations.keys():
-            # Save each conversation to original_snippets
+            # Get triples if available, else empty list
+            triples = all_extracted_triples_per_conversation.get(conv_index, [])
+
             snippet_filename = f"original_ReDial_snippet_{num_shots}shots_{conv_index}.json"
             snippet_path_indexed = os.path.join(originalSnippetsDir, snippet_filename)
-            
+
             with open(snippet_path_indexed, "w", encoding="utf-8") as file:
                 json.dump([all_conversations[conv_index]], file, indent=2, ensure_ascii=False)
-            
-            # Save extracted triples for this conversation
+
             recommendations_filename = f"{num_shots}shots_{conv_index}.json"
             recommendations_path_indexed = os.path.join(recommendationsDir, recommendations_filename)
-            
-            triples_as_strings = [
-                f"({triple[0]}, {triple[1]}, {triple[2]})" 
-                for triple in all_extracted_triples_per_conversation[conv_index]
-            ]
-            
+
+            triples_as_strings = [f"({t[0]}, {t[1]}, {t[2]})" for t in triples]
+
             with open(recommendations_path_indexed, "w") as file:
                 json.dump(triples_as_strings, file, indent=2)
-            
+
             print(f"  Saved conversation {conv_index}: {len(triples_as_strings)} triples")
+
         
         print(f"Finished saving all {len(all_conversations)} conversations for {num_shots}-shot")
     else:
