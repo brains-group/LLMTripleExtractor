@@ -15,6 +15,11 @@ import datasets
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import shutil
+from glob import glob
+
+from augmentDataset import AugmentDataset
+
 random.seed(2025)
 """
 CHANGES: 
@@ -169,7 +174,7 @@ def extractTriplesFromResponse(response):
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--base_model_path", type=str, default="Qwen/Qwen3-0.6B")
-parser.add_argument("--num_test_points", type=int, default=300)
+parser.add_argument("--num_test_points", type=int, default=None)
 parser.add_argument("--do_not_load_model", action=argparse.BooleanOptionalAction)
 args = parser.parse_args()
 print(args)
@@ -437,21 +442,109 @@ def runTests(dataset, shots=[], name=None, num_shots=0):
         ),
     )
 
+def stitch_json_files():
+    OUTPUT_FILE = "stitched_conversations.json"
+    stitched = []
 
-movieDataset = load_dataset("community-datasets/re_dial")["test"].to_list()
-random.shuffle(movieDataset)
+    # Get all JSON files in the augmented dataset directory
+    json_files = sorted(glob(os.path.join(AUGMENTED_DIR, "*.json")))
 
-numShots = 10
-shots = movieDataset[:numShots]
-testSet = movieDataset[numShots : (numShots + args.num_test_points)]
+    for path in json_files:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-print("Performing 0-Shot Test:")
-print(f"0-Shot Scores: {runTests(testSet, num_shots=0)}")
-print("Performing 1-Shot Test:")
-print(f"1-Shot Scores: {runTests(testSet, shots[:1], num_shots=1)}")
-print("Performing 3-Shot Test:")
-print(f"3-Shot Scores: {runTests(testSet, shots[:3], num_shots=3)}")
-print("Performing 5-Shot Test:")
-print(f"5-Shot Scores: {runTests(testSet, shots[:5], num_shots=5)}")
-print("Performing 10-Shot Test:")
-print(f"10-Shot Scores: {runTests(testSet, shots[:10], num_shots=10)}")
+        # Each file is a list containing a single conversation
+        if isinstance(data, list):
+            stitched.extend(data)
+        else:
+            stitched.append(data)
+
+        print(f"Added {os.path.basename(path)} ({len(data)} conversation(s))")
+
+    # Save the combined result
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(stitched, f, indent=2, ensure_ascii=False)
+
+    print(f"\nStitched {len(stitched)} conversations into {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    movieDataset = load_dataset("community-datasets/re_dial")["test"].to_list()
+    random.shuffle(movieDataset)
+
+    numShots = 10
+    shots = movieDataset[:numShots]
+    if args.num_test_points:
+        testSet = movieDataset[numShots : (numShots + args.num_test_points)]
+    else:
+        testSet = movieDataset[numShots:]
+
+    # print("Performing 0-Shot Test:")
+    # print(f"0-Shot Scores: {runTests(testSet, num_shots=0)}")
+    # print("Performing 1-Shot Test:")
+    # print(f"1-Shot Scores: {runTests(testSet, shots[:1], num_shots=1)}")
+    # print("Performing 3-Shot Test:")
+    # print(f"3-Shot Scores: {runTests(testSet, shots[:3], num_shots=3)}")
+    print("Performing 5-Shot Test:")
+    print(f"5-Shot Scores: {runTests(testSet, shots[:5], num_shots=5)}")
+    # print("Performing 10-Shot Test:")
+    # print(f"10-Shot Scores: {runTests(testSet, shots[:10], num_shots=10)}")
+
+
+    RECOMMENDATIONS_DIR = "recommendations"
+    ORIGINAL_SNIPPETS_DIR = "original_snippets"
+    AUGMENTED_DIR = "augmentedDatasets"
+    
+    # Clear and recreate augmented folder
+    if os.path.exists(AUGMENTED_DIR):
+        shutil.rmtree(AUGMENTED_DIR)
+    os.makedirs(AUGMENTED_DIR, exist_ok=True)
+
+    # Loop through all JSON files in recommendations folder
+    recommendation_files = glob(os.path.join(RECOMMENDATIONS_DIR, "*.json"))
+
+    processed_count = 0
+    for rec_path in recommendation_files:
+        base_name = os.path.splitext(os.path.basename(rec_path))[0]
+        print(f"\n{'='*60}")
+        print(f"Processing: {base_name}")
+        print(f"{'='*60}")
+
+        # Skip 0-shot files
+        if base_name.lower().startswith("0shots"):
+            print(f"Skipping {base_name} (0-shot file detected)")
+            continue
+
+        # Expected format: "5shots_0", "5shots_1", etc.
+        match = re.match(r"(\d+shots_\d+)", base_name)
+        if not match:
+            print(f"WARNING: Filename doesn't match expected pattern: {base_name}")
+            continue
+        
+        pattern = match.group(1)
+        
+        # Find corresponding original snippet
+        snippet_path = os.path.join(
+            ORIGINAL_SNIPPETS_DIR, f"original_ReDial_snippet_{pattern}.json"
+        )
+        
+        if not os.path.exists(snippet_path):
+            print(f"WARNING: No matching snippet found for {base_name}")
+            print(f"Expected: {snippet_path}")
+            continue
+
+        # Process the conversation
+        processor = AugmentDataset()
+        processor.load_conversation_from_snippet(snippet_path)
+        processor.load_triples_from_file(rec_path)
+        processor.update_conversation()
+
+        updated_path = os.path.join(AUGMENTED_DIR, f"updated_ReDial_from_{base_name}.json")
+        processor.save_updated_conversation(updated_path)
+        
+        processed_count += 1
+
+    print(f"\n{'='*60}")
+    print(f"Processing complete! Processed {processed_count} conversations.")
+    print(f"{'='*60}")
+
+    stitch_json_files()

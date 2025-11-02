@@ -23,7 +23,7 @@ Currently, the updates are not very robust since it's all dependent on the tripl
 '''
 class AugmentDataset:
     def __init__(self):
-        self.conversation = None
+        self.conversation = None 
         self.extracted_triples = []
 
     def load_conversation_from_snippet(self, path):
@@ -183,61 +183,63 @@ class AugmentDataset:
             json.dump([self.conversation], f, indent=2, ensure_ascii=False)
         print(f"Updated conversation saved to {path}")
 
+# if __name__ == "__main__":
+#     RECOMMENDATIONS_DIR = "recommendations"
+#     ORIGINAL_SNIPPETS_DIR = "original_snippets"
+#     AUGMENTED_DIR = "augmentedDatasets"
+    
+#     # Clear and recreate augmented folder
+#     if os.path.exists(AUGMENTED_DIR):
+#         shutil.rmtree(AUGMENTED_DIR)
+#     os.makedirs(AUGMENTED_DIR, exist_ok=True)
 
-if __name__ == "__main__":
-    RECOMMENDATIONS_DIR = "recommendations"
-    ORIGINAL_SNIPPETS_DIR = "original_snippets"
-    AUGMENTED_DIR = "augmentedDatasets"
+#     # Loop through all JSON files in recommendations folder
+#     recommendation_files = glob(os.path.join(RECOMMENDATIONS_DIR, "*.json"))
 
-    # Clear and recreate augmented folder
-    if os.path.exists(AUGMENTED_DIR):
-        shutil.rmtree(AUGMENTED_DIR)
-    os.makedirs(AUGMENTED_DIR, exist_ok=True)
+#     processed_count = 0
+#     for rec_path in recommendation_files:
+#         base_name = os.path.splitext(os.path.basename(rec_path))[0]
+#         print(f"\n{'='*60}")
+#         print(f"Processing: {base_name}")
+#         print(f"{'='*60}")
 
-    # Loop through all JSON files in recommendations folder
-    recommendation_files = glob(os.path.join(RECOMMENDATIONS_DIR, "*.json"))
+#         # Skip 0-shot files
+#         if base_name.lower().startswith("0shots"):
+#             print(f"Skipping {base_name} (0-shot file detected)")
+#             continue
 
-    processed_count = 0
-    for rec_path in recommendation_files:
-        base_name = os.path.splitext(os.path.basename(rec_path))[0]
-        print(f"\n{'='*60}")
-        print(f"Processing: {base_name}")
-        print(f"{'='*60}")
-
-        # Skip 0-shot files
-        if base_name.lower().startswith("0shots"):
-            print(f"Skipping {base_name} (0-shot file detected)")
-            continue
-
-        # Expected format: "5shots_0", "5shots_1", etc.
-        match = re.match(r"(\d+shots_\d+)", base_name)
-        if not match:
-            print(f"WARNING: Filename doesn't match expected pattern: {base_name}")
-            continue
+#         # Expected format: "5shots_0", "5shots_1", etc.
+#         match = re.match(r"(\d+shots_\d+)", base_name)
+#         if not match:
+#             print(f"WARNING: Filename doesn't match expected pattern: {base_name}")
+#             continue
         
-        pattern = match.group(1)
+#         pattern = match.group(1)
         
-        # Find corresponding original snippet
-        snippet_path = os.path.join(
-            ORIGINAL_SNIPPETS_DIR, f"original_ReDial_snippet_{pattern}.json"
-        )
+#         # Find corresponding original snippet
+#         snippet_path = os.path.join(
+#             ORIGINAL_SNIPPETS_DIR, f"original_ReDial_snippet_{pattern}.json"
+#         )
         
-        if not os.path.exists(snippet_path):
-            print(f"WARNING: No matching snippet found for {base_name}")
-            print(f"Expected: {snippet_path}")
-            continue
+#         if not os.path.exists(snippet_path):
+#             print(f"WARNING: No matching snippet found for {base_name}")
+#             print(f"Expected: {snippet_path}")
+#             continue
 
-        # Process the conversation
-        processor = AugmentDataset()
-        processor.load_conversation_from_snippet(snippet_path)
-        processor.load_triples_from_file(rec_path)
-        processor.update_conversation()
+#         # Process the conversation
+#         processor = AugmentDataset()
+#         processor.load_conversation_from_snippet(snippet_path)
+#         processor.load_triples_from_file(rec_path)
+#         processor.update_conversation()
 
-        updated_path = os.path.join(AUGMENTED_DIR, f"updated_ReDial_from_{base_name}.json")
-        processor.save_updated_conversation(updated_path)
+#         updated_path = os.path.join(AUGMENTED_DIR, f"updated_ReDial_from_{base_name}.json")
+#         processor.save_updated_conversation(updated_path)
         
-        processed_count += 1
+#         processed_count += 1
 
-    print(f"\n{'='*60}")
-    print(f"Processing complete! Processed {processed_count} conversations.")
-    print(f"{'='*60}")
+#     print(f"\n{'='*60}")
+#     print(f"Processing complete! Processed {processed_count} conversations.")
+#     print(f"{'='*60}")
+
+#     stitch_json_files()
+
