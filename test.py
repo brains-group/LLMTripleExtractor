@@ -19,6 +19,7 @@ import shutil
 from glob import glob
 
 from augmentDataset import AugmentDataset
+from evaluateDataset import EvaluateAugmentedDataset
 
 random.seed(2025)
 """
@@ -30,17 +31,17 @@ There is added logic in test.py currently to only save 5 shot versions of recomm
 
 Prompt has additions for relations, their definitions, and a blank spot for the schema.
 
-
+Added support for any size Qwen model with proper memory management and device handling. Were some errors before that were causing some crashes on larger models.
 """
 PROMPT = """You are a highly precise information extraction engine. Your task is to analyze the following conversation and extract triples about the user's relationships and preferences for a personal knowledge graph.
 
 The triples must strictly follow the format: (User, [Relation], [Object])
 
 ### Allowed Relations:
-- Likes: The user explicitly states a positive preference, enjoyment, or favorable opinion about something.
-- Dislikes: The user explicitly states a negative preference, dislike, or unfavorable opinion about something.
-- Seen: The user explicitly states they have experienced, watched, read, visited, or encountered the object.
-- notSeen: The user explicitly states they have NOT experienced, watched, read, visited, or encountered the object.
+- Likes: The user expresses positive preference, enjoyment, or favorable opinion about something.
+- Dislikes: The user expresses negative preference, dislike, or unfavorable opinion about something.
+- Seen: The user indicates they have experienced, watched, read, visited, or encountered the object.
+- notSeen: The user indicates they have NOT experienced, watched, read, visited, or encountered the object.
 - wasSuggested: An item, activity, or topic is recommended to the user by the assistant.
 
 ### Rules:
@@ -124,7 +125,7 @@ def getTriples(datapoint):
             triples.append(
                 (
                     "User",
-                    "seen" if answerSet["liked"] == 1 else "unseen",
+                    "seen" if answerSet["seen"] == 1 else "unseen",
                     movieMentions[answerSet["movieId"]],
                 )
             )
@@ -176,39 +177,82 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--base_model_path", type=str, default="Qwen/Qwen3-0.6B")
 parser.add_argument("--num_test_points", type=int, default=None)
 parser.add_argument("--do_not_load_model", action=argparse.BooleanOptionalAction)
+parser.add_argument("--device", type=str, default="auto", help="Device to use: 'cuda', 'cpu', or 'auto'")
+parser.add_argument("--load_in_8bit", action="store_true", help="Load model in 8-bit precision for memory efficiency")
+parser.add_argument("--load_in_4bit", action="store_true", help="Load model in 4-bit precision for maximum memory efficiency")
 args = parser.parse_args()
 print(args)
 
+# ============= Setup device and model loading config =============
+if args.device == "auto":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+else:
+    device = args.device
+
+print(f"Using device: {device}")
+
 # ============= Generate responses =============
 if not args.do_not_load_model:
-    device = "cuda"
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base_model_path, torch_dtype=torch.float16
-    ).to(device)
+    model_kwargs = {
+        "torch_dtype": torch.float16 if device == "cuda" else torch.float32,
+        "low_cpu_mem_usage": True,
+    }
+    
+    # Add quantization if requested (requires bitsandbytes)
+    if args.load_in_8bit:
+        model_kwargs["load_in_8bit"] = True
+        model_kwargs["device_map"] = "auto"
+        print("Loading model in 8-bit precision")
+    elif args.load_in_4bit:
+        model_kwargs["load_in_4bit"] = True
+        model_kwargs["device_map"] = "auto"
+        print("Loading model in 4-bit precision")
+    else:
+        # For non-quantized models, handle device placement manually
+        if device == "cuda":
+            # Check available GPU memory and decide on device_map
+            if torch.cuda.is_available():
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9  # in GB
+                print(f"Available GPU memory: {gpu_memory:.2f} GB")
+                
+                # For larger models (>3B params), use device_map="auto" for better memory management
+                model_kwargs["device_map"] = "auto"
+        
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base_model_path, 
+            **model_kwargs
+        )
+        
+        # Only move to device if not using device_map
+        if "device_map" not in model_kwargs:
+            model = model.to(device)
+            
+        print(f"Model loaded successfully on {device}")
+        
+        # Enable gradient checkpointing for larger models to save memory
+        if hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable()
+            
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        print("Try using --load_in_8bit or --load_in_4bit flags for large models")
+        sys.exit(1)
+else:
+    model = None
+
 tokenizer = AutoTokenizer.from_pretrained(args.base_model_path, use_fast=False)
+
+# Set pad token if not set
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
 
 
 def runTests(dataset, shots=[], name=None, num_shots=0):
     if name is None:
-        name = args.base_model_path + "_" + str(len(shots)) + "shot"
+        name = args.base_model_path.replace("/", "_") + "_" + str(len(shots)) + "shot"
     responses = []
     responsesPath = "responses/" + name + ".json"
-    
-    # Create recommendations directory if it doesn't exist
-    recommendationsDir = "recommendations"
-    if not os.path.exists(recommendationsDir):
-        os.makedirs(recommendationsDir)
-    
-    # Create original_snippets directory if it doesn't exist
-    originalSnippetsDir = "original_snippets"
-    if not os.path.exists(originalSnippetsDir):
-        os.makedirs(originalSnippetsDir)
-    
-    # Path for saving extracted triples
-    recommendationsPath = os.path.join(recommendationsDir, f"{num_shots}shots.json")
-    
-    # Path for saving original conversation snippet
-    snippetPath = os.path.join(originalSnippetsDir, f"original_ReDial_snippet_{num_shots}shots.json")
     
     saveResponses = True
     if os.path.exists(responsesPath):
@@ -252,25 +296,41 @@ def runTests(dataset, shots=[], name=None, num_shots=0):
 
             print(f"---------------- PROMPT --------------\n{text}")
 
-            model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+            # Use model.device if available, otherwise use the device variable
+            model_device = model.device if hasattr(model, 'device') else device
+            model_inputs = tokenizer([text], return_tensors="pt").to(model_device)
 
-            generated_ids = model.generate(
-                **model_inputs,
-                max_new_tokens=4096,
-            )
+            # Add generation config for better stability across model sizes
+            generation_config = {
+                "max_new_tokens": 4096,
+                "do_sample": False,  # Use greedy decoding for consistency
+                "pad_token_id": tokenizer.pad_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+            }
+
+            with torch.no_grad():  # Disable gradients for inference
+                generated_ids = model.generate(
+                    **model_inputs,
+                    **generation_config,
+                )
+            
             generated_ids = [
                 output_ids[len(input_ids) :]
                 for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
             ]
 
-            response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[
-                0
-            ]
+            response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
             responses.append(response)
+            
+            # Clear CUDA cache periodically to prevent OOM
+            if device == "cuda" and index % 10 == 0:
+                torch.cuda.empty_cache()
         else:
             response = responses[index]
+            
         print(f"---------------- RESPONSE --------------\n{response}")
+        
         if "Qwen" in args.base_model_path:
             endThinkString = "</think>"
             endThinkIndex = response.rfind(endThinkString)
@@ -345,7 +405,9 @@ def runTests(dataset, shots=[], name=None, num_shots=0):
         mrr[index] = 0
         if rank >= 0:
             mrr[index] += 1 / (rank + 1)
-            if len(hits[index]) < len(recommendations):
+            if index not in hits:
+                hits[index] = [0] * len(recommendations)
+            elif len(hits[index]) < len(recommendations):
                 hits[index] += [hits[index][-1]] * (
                     len(recommendations) - len(hits[index])
                 )
@@ -360,40 +422,23 @@ def runTests(dataset, shots=[], name=None, num_shots=0):
     if saveResponses:
         with open(responsesPath, "w") as file:
             json.dump(responses, file)
- # ========REMOVE THIS LATER=====================================================================================   
-    # Only save files for 5-shot configuration
+            
     if num_shots == 5:
-        print(f"\nSaving {len(all_conversations)} conversations and their extracted triples...")
-        
-        for conv_index in all_conversations.keys():
-            # Get triples if available, else empty list
-            triples = all_extracted_triples_per_conversation.get(conv_index, [])
-
-            snippet_filename = f"original_ReDial_snippet_{num_shots}shots_{conv_index}.json"
-            snippet_path_indexed = os.path.join(originalSnippetsDir, snippet_filename)
-
-            with open(snippet_path_indexed, "w", encoding="utf-8") as file:
-                json.dump([all_conversations[conv_index]], file, indent=2, ensure_ascii=False)
-
-            recommendations_filename = f"{num_shots}shots_{conv_index}.json"
-            recommendations_path_indexed = os.path.join(recommendationsDir, recommendations_filename)
-
-            triples_as_strings = [f"({t[0]}, {t[1]}, {t[2]})" for t in triples]
-
-            with open(recommendations_path_indexed, "w") as file:
-                json.dump(triples_as_strings, file, indent=2)
-
-            print(f"  Saved conversation {conv_index}: {len(triples_as_strings)} triples")
-
-        
-        print(f"Finished saving all {len(all_conversations)} conversations for {num_shots}-shot")
+        print(f"Collected {len(all_conversations)} conversations and their extracted triples in-memory for {num_shots}-shot")
     else:
-        print(f"Skipping file save for {num_shots}-shot (only saving 5-shot)")
-#=========================================================================================================================
+        print(f"Collected {len(all_conversations)} conversations (not persisting snippets/recommendations to disk)")
+    
     def getSumOfDictVals(dictionary):
         return sum(dictionary.values())
 
-    return (
+    tp = getSumOfDictVals(truePositives)
+    fp = getSumOfDictVals(falsePositives)
+    fn = getSumOfDictVals(falseNegatives)
+
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+
+    stats_str = (
         "\nOverall Stats\n"
         "Number of Tests: {num_tests}\n"
         "Precision: {precision}\n"
@@ -403,68 +448,42 @@ def runTests(dataset, shots=[], name=None, num_shots=0):
     ).format(
         num_tests=numDatapoints,
         precision=(
-            str(
-                prec := getSumOfDictVals(truePositives)
-                / (getSumOfDictVals(truePositives) + getSumOfDictVals(falsePositives))
-            )
-        )
-        + " - "
-        + str(math.sqrt(prec * (1 - prec) / numDatapoints)),
-        recall=str(
-            rec := getSumOfDictVals(truePositives)
-            / (getSumOfDictVals(truePositives) + getSumOfDictVals(falseNegatives))
-        )
-        + " - "
-        + str(math.sqrt(rec * (1 - rec) / numDatapoints)),
-        mrr=str(getSumOfDictVals(mrr) / numDatapoints)
-        + " - "
-        + str(statistics.stdev(mrr.values()) if numDatapoints > 1 else 0),
-        hits="\n".join(
-            [
+            str(prec)
+            + " - "
+            + str(math.sqrt(prec * (1 - prec) / numDatapoints) if numDatapoints > 0 else 0.0)
+        ),
+        recall=(
+            str(rec)
+            + " - "
+            + str(math.sqrt(rec * (1 - rec) / numDatapoints) if numDatapoints > 0 else 0.0)
+        ),
+        mrr=(
+            str(getSumOfDictVals(mrr) / numDatapoints if numDatapoints > 0 else 0)
+            + " - "
+            + str(statistics.stdev(list(mrr.values())) if len(mrr) > 1 else 0)
+        ),
+        hits=(
+            "\n".join([
                 "Hits@{}: {} - {}".format(
                     hitIndex + 1,
-                    hitVal := sum(
-                        [
-                            (
-                                hitList[hitIndex]
-                                if hitIndex < len(hitList)
-                                else hitList[-1]
-                            )
+                    hitVal := (
+                        sum([
+                            (hitList[hitIndex] if hitIndex < len(hitList) else hitList[-1])
                             for hitList in hits.values()
-                        ]
-                    )
-                    / numDatapoints,
-                    math.sqrt(hitVal * (1 - hitVal) / numDatapoints),
+                        ]) / numDatapoints if numDatapoints > 0 else 0
+                    ),
+                    math.sqrt(hitVal * (1 - hitVal) / numDatapoints) if numDatapoints > 0 else 0,
                 )
-                for hitIndex in range(max(len(hitList) for hitList in hits.values()))
-            ]
+                for hitIndex in range(max((len(hitList) for hitList in hits.values()), default=0))
+            ]) if hits else "No hits data"
         ),
     )
-
-def stitch_json_files():
-    OUTPUT_FILE = "stitched_conversations.json"
-    stitched = []
-
-    # Get all JSON files in the augmented dataset directory
-    json_files = sorted(glob(os.path.join(AUGMENTED_DIR, "*.json")))
-
-    for path in json_files:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        # Each file is a list containing a single conversation
-        if isinstance(data, list):
-            stitched.extend(data)
-        else:
-            stitched.append(data)
-
-        print(f"Added {os.path.basename(path)} ({len(data)} conversation(s))")
-
-    # Save the combined result
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(stitched, f, indent=2, ensure_ascii=False)
-
-    print(f"\nStitched {len(stitched)} conversations into {OUTPUT_FILE}")
+    
+    return (
+        stats_str,
+        all_conversations,
+        all_extracted_triples_per_conversation,
+    )
 
 if __name__ == "__main__":
     movieDataset = load_dataset("community-datasets/re_dial")["test"].to_list()
@@ -477,78 +496,56 @@ if __name__ == "__main__":
     else:
         testSet = movieDataset[numShots:]
 
-    # print("Performing 0-Shot Test:")
-    # print(f"0-Shot Scores: {runTests(testSet, num_shots=0)}")
-    # print("Performing 1-Shot Test:")
-    # print(f"1-Shot Scores: {runTests(testSet, shots[:1], num_shots=1)}")
-    # print("Performing 3-Shot Test:")
-    # print(f"3-Shot Scores: {runTests(testSet, shots[:3], num_shots=3)}")
     print("Performing 5-Shot Test:")
-    print(f"5-Shot Scores: {runTests(testSet, shots[:5], num_shots=5)}")
-    # print("Performing 10-Shot Test:")
-    # print(f"10-Shot Scores: {runTests(testSet, shots[:10], num_shots=10)}")
+    stats_str, all_conversations, all_extracted_triples_per_conversation = runTests(
+        testSet, shots[:5], num_shots=5
+    )
+    print(f"5-Shot Scores:\n{stats_str}")
 
-
-    RECOMMENDATIONS_DIR = "recommendations"
-    ORIGINAL_SNIPPETS_DIR = "original_snippets"
-    AUGMENTED_DIR = "augmentedDatasets"
-    
-    # Clear and recreate augmented folder
-    if os.path.exists(AUGMENTED_DIR):
-        shutil.rmtree(AUGMENTED_DIR)
-    os.makedirs(AUGMENTED_DIR, exist_ok=True)
-
-    # Loop through all JSON files in recommendations folder
-    recommendation_files = glob(os.path.join(RECOMMENDATIONS_DIR, "*.json"))
-
+    stitched = []
+    kept_indices = []  
     processed_count = 0
-    for rec_path in recommendation_files:
-        base_name = os.path.splitext(os.path.basename(rec_path))[0]
-        print(f"\n{'='*60}")
-        print(f"Processing: {base_name}")
-        print(f"{'='*60}")
 
-        # Skip 0-shot files
-        if base_name.lower().startswith("0shots"):
-            print(f"Skipping {base_name} (0-shot file detected)")
-            continue
+    # Sort by the original index (ReDial order)
+    for index in sorted(all_conversations.keys()):
+        conv = all_conversations[index]
+        triples = all_extracted_triples_per_conversation.get(index, [])
 
-        # Expected format: "5shots_0", "5shots_1", etc.
-        match = re.match(r"(\d+shots_\d+)", base_name)
-        if not match:
-            print(f"WARNING: Filename doesn't match expected pattern: {base_name}")
-            continue
-        
-        pattern = match.group(1)
-        
-        # Find corresponding original snippet
-        snippet_path = os.path.join(
-            ORIGINAL_SNIPPETS_DIR, f"original_ReDial_snippet_{pattern}.json"
-        )
-        
-        if not os.path.exists(snippet_path):
-            print(f"WARNING: No matching snippet found for {base_name}")
-            print(f"Expected: {snippet_path}")
-            continue
-
-        # Process the conversation
         processor = AugmentDataset()
-        processor.load_conversation_from_snippet(snippet_path)
-        processor.load_triples_from_file(rec_path)
+        processor.load_conversation_from_data(conv)
+        processor.load_triples_from_list(triples)
 
         if not processor.extracted_triples:
-            print(f"Skipping {base_name}: no triples found.")
             continue
 
         processor.update_conversation()
-
-        updated_path = os.path.join(AUGMENTED_DIR, f"updated_ReDial_from_{base_name}.json")
-        processor.save_updated_conversation(updated_path)
+        augmented_conv = processor.conversation
         
+        if "conversationId" in conv:
+            augmented_conv["_original_conversation_id"] = conv["conversationId"]
+        augmented_conv["_original_index"] = index
+        
+        stitched.append(augmented_conv)
+        kept_indices.append(index) 
         processed_count += 1
 
     print(f"\n{'='*60}")
     print(f"Processing complete! Processed {processed_count} conversations.")
     print(f"{'='*60}")
 
-    stitch_json_files()
+    OUTPUT_FILE = "stitched_conversations.json"
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(stitched, f, indent=2, ensure_ascii=False)
+
+    print(f"\nStitched {len(stitched)} conversations into {OUTPUT_FILE}")
+
+    filtered_testSet = [testSet[i] for i in kept_indices]
+    with open("test_set.json", "w", encoding="utf-8") as f:
+        json.dump(filtered_testSet, f, indent=2, ensure_ascii=False)
+
+    print(f"Saved {len(filtered_testSet)} filtered conversations to test_set.json for evaluation")
+
+    evaluator = EvaluateAugmentedDataset(
+        stitched_path="stitched_conversations.json"
+    )
+    metrics = evaluator.evaluate()

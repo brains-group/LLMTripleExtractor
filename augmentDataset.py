@@ -21,6 +21,7 @@ Run the script using python augmentedDataset.py
 
 Currently, the updates are not very robust since it's all dependent on the triples extracted. This means we have a lot of '2s' coming through in the updated dataset.
 '''
+
 class AugmentDataset:
     def __init__(self):
         self.conversation = None 
@@ -38,64 +39,6 @@ class AugmentDataset:
             raise ValueError(f"Invalid snippet format in {path}")
         
         print(f"Loaded conversation from {path}")
-
-    def load_triples_from_file(self, path):
-        """Load extracted triples from recommendations file"""
-        with open(path, "r", encoding="utf-8") as f:
-            raw_triples = json.load(f)
-
-        converted_triples = []
-        for triple in raw_triples:
-            if isinstance(triple, str):
-                triple_clean = triple.strip()
-
-                # Fix global imbalance first
-                open_parens = triple_clean.count("(")
-                close_parens = triple_clean.count(")")
-                if open_parens > close_parens:
-                    triple_clean += ")" * (open_parens - close_parens)
-                elif close_parens > open_parens:
-                    triple_clean = "(" * (close_parens - open_parens) + triple_clean
-
-                # Remove surrounding parentheses if they wrap the entire triple
-                if triple_clean.startswith("(") and triple_clean.endswith(")"):
-                    triple_clean = triple_clean[1:-1]
-
-                # Split by comma (into at most 3 parts)
-                parts = triple_clean.split(",", 2)
-
-                if len(parts) == 3:
-                    subject = parts[0].strip(" ()\"")
-                    relation = parts[1].strip(" ()\"")
-                    obj = parts[2].strip(" ()\"")
-
-                    # Fix missing parentheses in movie titles "Get Out (2017")
-                    if obj.count("(") > obj.count(")"):
-                        obj += ")" * (obj.count("(") - obj.count(")"))
-                    elif obj.count(")") > obj.count("("):
-                        obj = "(" * (obj.count(")") - obj.count("(")) + obj
-
-                    converted_triples.append([subject, relation, obj])
-                else:
-                    print(f"Skipping malformed triple (after fix): {triple_clean}")
-
-            elif isinstance(triple, (list, tuple)) and len(triple) == 3:
-                # Also ensure parentheses balance in list-form triples
-                subj, rel, obj = triple
-                subj, rel, obj = str(subj), str(rel), str(obj)
-                if obj.count("(") > obj.count(")"):
-                    obj += ")" * (obj.count("(") - obj.count(")"))
-                elif obj.count(")") > obj.count("("):
-                    obj = "(" * (obj.count(")") - obj.count("(")) + obj
-                converted_triples.append([subj, rel, obj])
-
-            else:
-                print(f"Skipping malformed triple: {triple}")
-
-        self.extracted_triples = converted_triples
-        print(f"Loaded {len(self.extracted_triples)} valid triple(s) from {path}")
-
-
 
     def update_conversation(self):
         """Update the conversation's ground truth with extracted triples"""
@@ -183,63 +126,71 @@ class AugmentDataset:
             json.dump([self.conversation], f, indent=2, ensure_ascii=False)
         print(f"Updated conversation saved to {path}")
 
-# if __name__ == "__main__":
-#     RECOMMENDATIONS_DIR = "recommendations"
-#     ORIGINAL_SNIPPETS_DIR = "original_snippets"
-#     AUGMENTED_DIR = "augmentedDatasets"
-    
-#     # Clear and recreate augmented folder
-#     if os.path.exists(AUGMENTED_DIR):
-#         shutil.rmtree(AUGMENTED_DIR)
-#     os.makedirs(AUGMENTED_DIR, exist_ok=True)
+    def load_conversation_from_data(self, conversation_obj):
+        """Load the conversation from an in-memory object (no file IO)."""
+        if isinstance(conversation_obj, dict):
+            self.conversation = conversation_obj
+        elif isinstance(conversation_obj, list) and len(conversation_obj) > 0 and isinstance(conversation_obj[0], dict):
+            # sometimes callers may pass a single-element list containing the conversation
+            self.conversation = conversation_obj[0]
+        else:
+            raise ValueError("Invalid conversation object provided")
+        print("Loaded conversation from in-memory object")
 
-#     # Loop through all JSON files in recommendations folder
-#     recommendation_files = glob(os.path.join(RECOMMENDATIONS_DIR, "*.json"))
+    def load_triples_from_list(self, raw_triples):
+        """Load extracted triples from an in-memory list (no file IO).
 
-#     processed_count = 0
-#     for rec_path in recommendation_files:
-#         base_name = os.path.splitext(os.path.basename(rec_path))[0]
-#         print(f"\n{'='*60}")
-#         print(f"Processing: {base_name}")
-#         print(f"{'='*60}")
+        raw_triples may be a list of strings like "(User, likes, Movie (2017))"
+        or a list of 3-tuples/lists.
+        """
+        converted_triples = []
+        for triple in raw_triples:
+            if isinstance(triple, str):
+                triple_clean = triple.strip()
 
-#         # Skip 0-shot files
-#         if base_name.lower().startswith("0shots"):
-#             print(f"Skipping {base_name} (0-shot file detected)")
-#             continue
+                # Fix global imbalance first
+                open_parens = triple_clean.count("(")
+                close_parens = triple_clean.count(")")
+                if open_parens > close_parens:
+                    triple_clean += ")" * (open_parens - close_parens)
+                elif close_parens > open_parens:
+                    triple_clean = "(" * (close_parens - open_parens) + triple_clean
 
-#         # Expected format: "5shots_0", "5shots_1", etc.
-#         match = re.match(r"(\d+shots_\d+)", base_name)
-#         if not match:
-#             print(f"WARNING: Filename doesn't match expected pattern: {base_name}")
-#             continue
-        
-#         pattern = match.group(1)
-        
-#         # Find corresponding original snippet
-#         snippet_path = os.path.join(
-#             ORIGINAL_SNIPPETS_DIR, f"original_ReDial_snippet_{pattern}.json"
-#         )
-        
-#         if not os.path.exists(snippet_path):
-#             print(f"WARNING: No matching snippet found for {base_name}")
-#             print(f"Expected: {snippet_path}")
-#             continue
+                # Remove surrounding parentheses if they wrap the entire triple
+                if triple_clean.startswith("(") and triple_clean.endswith(")"):
+                    triple_clean = triple_clean[1:-1]
 
-#         # Process the conversation
-#         processor = AugmentDataset()
-#         processor.load_conversation_from_snippet(snippet_path)
-#         processor.load_triples_from_file(rec_path)
-#         processor.update_conversation()
+                # Split by comma (into at most 3 parts)
+                parts = triple_clean.split(",", 2)
 
-#         updated_path = os.path.join(AUGMENTED_DIR, f"updated_ReDial_from_{base_name}.json")
-#         processor.save_updated_conversation(updated_path)
-        
-#         processed_count += 1
+                if len(parts) == 3:
+                    subject = parts[0].strip(" ()\"")
+                    relation = parts[1].strip(" ()\"")
+                    obj = parts[2].strip(" ()\"")
 
-#     print(f"\n{'='*60}")
-#     print(f"Processing complete! Processed {processed_count} conversations.")
-#     print(f"{'='*60}")
+                    # Fix missing parentheses in movie titles "Get Out (2017"
+                    if obj.count("(") > obj.count(")"):
+                        obj += ")" * (obj.count("(") - obj.count(")"))
+                    elif obj.count(")") > obj.count("("):
+                        obj = "(" * (obj.count(")") - obj.count("(") ) + obj
 
-#     stitch_json_files()
+                    converted_triples.append([subject, relation, obj])
+                else:
+                    print(f"Skipping malformed triple (after fix): {triple_clean}")
+
+            elif isinstance(triple, (list, tuple)) and len(triple) == 3:
+                subj, rel, obj = triple
+                subj, rel, obj = str(subj), str(rel), str(obj)
+                if obj.count("(") > obj.count(")"):
+                    obj += ")" * (obj.count("(") - obj.count(")"))
+                elif obj.count(")") > obj.count("("):
+                    obj = "(" * (obj.count(")") - obj.count("(") ) + obj
+                converted_triples.append([subj, rel, obj])
+
+            else:
+                print(f"Skipping malformed triple: {triple}")
+
+        self.extracted_triples = converted_triples
+        print(f"Loaded {len(self.extracted_triples)} valid triple(s) from in-memory list")
+
 
