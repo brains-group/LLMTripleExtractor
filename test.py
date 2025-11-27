@@ -12,6 +12,7 @@ import statistics
 
 from tqdm import tqdm
 import datasets
+
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -32,6 +33,12 @@ There is added logic in test.py currently to only save 5 shot versions of recomm
 Prompt has additions for relations, their definitions, and a blank spot for the schema.
 
 Added support for any size Qwen model with proper memory management and device handling. Were some errors before that were causing some crashes on larger models.
+
+BATCHING: Added batch processing for significant speedup on inference.
+
+FULL DATASET: Now runs on combined train + test data.
+
+OPTIMIZATIONS: 0-shot, reduced tokens, early stopping
 """
 PROMPT = """You are a highly precise information extraction engine. Your task is to analyze the following conversation and extract triples about the user's relationships and preferences for a personal knowledge graph.
 
@@ -51,6 +58,13 @@ The triples must strictly follow the format: (User, [Relation], [Object])
 4. Focus only on triples where the user is the subject.
 5. Provide triples for all applicable relations.
 6. Extract triples for any domain or topic - not limited to a specific category.
+7. You must output ONLY triples, one per line, in this exact form:
+(User, Likes, Interstellar)
+(User, Seen, Movie_123)
+8. Do NOT output any other text, explanation, or tags.
+If no triples exist, return exactly:
+(No triples found.)
+
 {}
 
 ### Schema:
@@ -59,9 +73,9 @@ The triples must strictly follow the format: (User, [Relation], [Object])
 ### Your Task
 
 **Input Conversation:**
-```json
+`````json
 {}
-```"""
+````"""
 
 TRIPLE_FORMAT = "({}, {}, {})"
 
@@ -82,8 +96,13 @@ def messagesToConversation(datapoint):
 
     def replaceMovieMentions(message):
         for movieMention in datapoint["movieMentions"]:
+            # Handle None movieName
+            movie_name = movieMention.get("movieName")
+            if movie_name is None:
+                movie_name = f"Movie_{movieMention['movieId']}"  # Fallback name
+            
             message = message.replace(
-                "@" + movieMention["movieId"], movieMention["movieName"]
+                "@" + movieMention["movieId"], movie_name
             )
         return message
 
@@ -103,9 +122,14 @@ def messagesToConversation(datapoint):
 
 def getTriples(datapoint):
     movieMentions = {
-        movieMention["movieId"]: movieMention["movieName"]
+        movieMention["movieId"]: (
+            movieMention["movieName"] 
+            if movieMention.get("movieName") is not None 
+            else f"Movie_{movieMention['movieId']}"
+        )
         for movieMention in datapoint["movieMentions"]
     }
+
     answers = (
         datapoint["initiatorQuestions"]
         if len(datapoint["initiatorQuestions"]) > 0
@@ -180,6 +204,8 @@ parser.add_argument("--do_not_load_model", action=argparse.BooleanOptionalAction
 parser.add_argument("--device", type=str, default="auto", help="Device to use: 'cuda', 'cpu', or 'auto'")
 parser.add_argument("--load_in_8bit", action="store_true", help="Load model in 8-bit precision for memory efficiency")
 parser.add_argument("--load_in_4bit", action="store_true", help="Load model in 4-bit precision for maximum memory efficiency")
+parser.add_argument("--batch_size", type=int, default=8, help="Batch size for inference")
+parser.add_argument("--num_shots", type=int, default=0, help="Number of few-shot examples (default: 0 for speed)")
 args = parser.parse_args()
 print(args)
 
@@ -208,31 +234,16 @@ if not args.do_not_load_model:
         model_kwargs["device_map"] = "auto"
         print("Loading model in 4-bit precision")
     else:
-        # For non-quantized models, handle device placement manually
+        # For non-quantized models, use device_map for better memory management
         if device == "cuda":
-            # Check available GPU memory and decide on device_map
-            if torch.cuda.is_available():
-                gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9  # in GB
-                print(f"Available GPU memory: {gpu_memory:.2f} GB")
-                
-                # For larger models (>3B params), use device_map="auto" for better memory management
-                model_kwargs["device_map"] = "auto"
+            model_kwargs["device_map"] = "cuda"
         
     try:
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model_path, 
             **model_kwargs
         )
-        
-        # Only move to device if not using device_map
-        if "device_map" not in model_kwargs:
-            model = model.to(device)
-            
         print(f"Model loaded successfully on {device}")
-        
-        # Enable gradient checkpointing for larger models to save memory
-        if hasattr(model, 'gradient_checkpointing_enable'):
-            model.gradient_checkpointing_enable()
             
     except Exception as e:
         print(f"Error loading model: {e}")
@@ -241,14 +252,14 @@ if not args.do_not_load_model:
 else:
     model = None
 
-tokenizer = AutoTokenizer.from_pretrained(args.base_model_path, use_fast=False)
+tokenizer = AutoTokenizer.from_pretrained(args.base_model_path, use_fast=True)
 
 # Set pad token if not set
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 
-def runTests(dataset, shots=[], name=None, num_shots=0):
+def runTests(dataset, shots=[], name=None, num_shots=0, batch_size=8):
     if name is None:
         name = args.base_model_path.replace("/", "_") + "_" + str(len(shots)) + "shot"
     responses = []
@@ -275,158 +286,188 @@ def runTests(dataset, shots=[], name=None, num_shots=0):
     all_extracted_triples_per_conversation = {}
     all_conversations = {}
     
-    for index, dataPoint in enumerate(tqdm(dataset)):
-        # Save all conversations
-        all_conversations[index] = dataPoint
+    # Process in batches
+    import time
+    total_start = time.time()
+    
+    for batch_start in tqdm(range(0, len(dataset), batch_size), desc="Processing batches"):
+        model_device = device
+        batch_end = min(batch_start + batch_size, len(dataset))
+        batch_datapoints = dataset[batch_start:batch_end]
+        batch_indices = list(range(batch_start, batch_end))
         
-        if saveResponses or index >= len(responses):
+        # Check if we need to generate responses for this batch
+        need_generation = saveResponses or batch_end > len(responses)
+        
+        if need_generation:
             saveResponses = True
-            text = tokenizer.apply_chat_template(
-                [
-                    {
-                        "content": PROMPT.format(
-                            createShots(shots), "", messagesToConversation(dataPoint)
-                        ),
+            batch_start_time = time.time()
+            
+            # Prepare all prompts in batch
+            texts = []
+            for dataPoint in batch_datapoints:
+                prompt_content = PROMPT.format(
+                    createShots(shots), "", messagesToConversation(dataPoint)
+                )
+                
+                text = tokenizer.apply_chat_template(
+                    [{
+                        "content": prompt_content,
                         "role": "user",
-                    }
-                ],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+                    }],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                texts.append(text)
+            
+            # Batch tokenization
+            # model_device = model.device if hasattr(model, 'device') else device
+            model_inputs = tokenizer(
+                texts, 
+                return_tensors="pt", 
+                padding=True,
+                padding_side="left",
+                truncation=True,
+                max_length=2048
+            ).to(model_device)
 
-            print(f"---------------- PROMPT --------------\n{text}")
-
-            # Use model.device if available, otherwise use the device variable
-            model_device = model.device if hasattr(model, 'device') else device
-            model_inputs = tokenizer([text], return_tensors="pt").to(model_device)
-
-            # Add generation config for better stability across model sizes
+            # Batch generation with early stopping
             generation_config = {
-                "max_new_tokens": 4096,
-                "do_sample": False,  # Use greedy decoding for consistency
+                "max_new_tokens": 512,  # Reduced from 512 - triples are short!
+                "do_sample": False,
                 "pad_token_id": tokenizer.pad_token_id,
                 "eos_token_id": tokenizer.eos_token_id,
             }
 
-            with torch.no_grad():  # Disable gradients for inference
+            with torch.no_grad():
                 generated_ids = model.generate(
                     **model_inputs,
                     **generation_config,
                 )
             
-            generated_ids = [
-                output_ids[len(input_ids) :]
-                for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-            ]
-
-            response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-
-            responses.append(response)
+            # Extract only the generated portion (remove input tokens)
+            generated_ids = generated_ids[:, model_inputs.input_ids.shape[1]:]
             
-            # Clear CUDA cache periodically to prevent OOM
-            if device == "cuda" and index % 10 == 0:
-                torch.cuda.empty_cache()
+            # Batch decode
+            batch_responses = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            
+            # Add to responses list
+            responses.extend(batch_responses)
+            
+            batch_time = time.time() - batch_start_time
+            print(f"Batch {batch_start//batch_size} ({len(batch_datapoints)} items) processed in {batch_time:.2f}s ({batch_time/len(batch_datapoints):.2f}s per item)")
         else:
-            response = responses[index]
-            
-        print(f"---------------- RESPONSE --------------\n{response}")
+            # Use cached responses
+            batch_responses = responses[batch_start:batch_end]
         
-        if "Qwen" in args.base_model_path:
-            endThinkString = "</think>"
-            endThinkIndex = response.rfind(endThinkString)
-            if endThinkIndex == -1:
-                print("Output did not complete thinking.")
-                continue
-        if len(tokenizer.encode(response, add_special_tokens=True)) > 4090:
-            print("Output did not complete.")
-            continue
-        if "Qwen" in args.base_model_path:
-            response = response[(endThinkIndex + len(endThinkString)) :]
-
-        goals = getTriples(dataPoint)
-        print(f"---------------- GOALS --------------\n{goals}")
-
-        # Extract triples from response for datapoints
-        extracted_triples = extractTriplesFromResponse(response)
-        all_extracted_triples_per_conversation[index] = extracted_triples
-        print(f"---------------- EXTRACTED TRIPLES --------------\n{extracted_triples}")
-
-        recommendations = re.findall(r"\([^,]+, [^,]+, [^\)]+\)?\)", response)
-        formatFollowed = len(recommendations) > 0
-        if formatFollowed:
-            falsePositives[index] += len(recommendations)
-        else:
-            recommendations = [response]
-        rank = -1
-        doBreak = False
-        for goal in goals:
-            goalNotFound = True
-            for recommendationIndex, recommendation in enumerate(recommendations):
-                foundGoal = False
-                recommendationSubstring = recommendation.lower()
-                firstIndex = recommendationSubstring.find(goal[0].lower())
-                if firstIndex >= 0:
-                    recommendationSubstring = recommendationSubstring[
-                        (firstIndex + len(goal[0])) :
-                    ]
-                    secondIndex = recommendationSubstring.find(goal[1].lower())
-                    if secondIndex >= 0:
-                        recommendationSubstring = recommendationSubstring[
-                            (secondIndex + len(goal[1])) :
-                        ]
-                        foundGoal = (
-                            recommendationSubstring.find(
-                                goal[2][: goal[2].find(" (")].lower()
-                            )
-                            >= 0
-                        )
-                if foundGoal:
-                    goalNotFound = False
-                    truePositives[index] += 1
-                    print(f"{goal} found in response.")
-                    if formatFollowed:
-                        falsePositives[index] -= 1
-                        if recommendationIndex < rank or rank == -1:
-                            rank = recommendationIndex
+        # Process each response in the batch
+        for local_idx, (index, dataPoint, response) in enumerate(zip(batch_indices, batch_datapoints, batch_responses)):
+            all_conversations[index] = dataPoint
+            
+            # Handle Qwen thinking tags (only for larger models)
+            if "Qwen" in args.base_model_path:
+                # Check model size - only process thinking for 2B+ models
+                model_name_lower = args.base_model_path.lower()
+                is_small_model = any(x in model_name_lower for x in ["0.5b", "0.6b", "1.5b", "1b"])
+                
+                if not is_small_model:
+                    endThinkString = "</think>"
+                    endThinkIndex = response.rfind(endThinkString)
+                    if endThinkIndex == -1:
+                        print(f"Warning: Datapoint {index} - thinking not completed, using full response")
                     else:
-                        rank = 0
-                        falseNegatives[index] += len(goals) - (goals.index(goal) + 1)
-                        doBreak = True
-                    recommendations.remove(recommendation)
-                    break
-            if goalNotFound:
-                falseNegatives[index] += 1
-                print(f"{goal} not found in response.")
-            if doBreak:
-                break
-        falseNegatives[index] = max(
-            0, min(20 - truePositives[index], falseNegatives[index])
-        )
-        mrr[index] = 0
-        if rank >= 0:
-            mrr[index] += 1 / (rank + 1)
-            if index not in hits:
-                hits[index] = [0] * len(recommendations)
-            elif len(hits[index]) < len(recommendations):
-                hits[index] += [hits[index][-1]] * (
-                    len(recommendations) - len(hits[index])
-                )
-            for i in range(rank, len(hits[index]), 1):
-                hits[index][i] += 1
-        numDatapoints += 1
-        print(f"truePositives[index]: {truePositives[index]}")
-        print(f"falsePositives[index]: {falsePositives[index]}")
-        print(f"falseNegatives[index]: {falseNegatives[index]}")
-        print(f"Hits@: {hits[index]}")
+                        response = response[(endThinkIndex + len(endThinkString)):]
+                else:
+                    # For small models, try to remove any incomplete thinking blocks
+                    startThinkString = "<think>"
+                    startThinkIndex = response.find(startThinkString)
+                    if startThinkIndex != -1:
+                        # Remove everything from <think> onward if incomplete
+                        endThinkString = "</think>"
+                        endThinkIndex = response.rfind(endThinkString)
+                        if endThinkIndex == -1:
+                            # Incomplete - remove from start of think tag
+                            response = response[:startThinkIndex]
+                        else:
+                            # Complete - remove the think block
+                            response = response[(endThinkIndex + len(endThinkString)):]
 
+            goals = getTriples(dataPoint)
+
+            # Extract triples from response
+            extracted_triples = extractTriplesFromResponse(response)
+            all_extracted_triples_per_conversation[index] = extracted_triples
+
+            recommendations = re.findall(r"\([^,]+, [^,]+, [^\)]+\)?\)", response)
+            formatFollowed = len(recommendations) > 0
+            if formatFollowed:
+                falsePositives[index] += len(recommendations)
+            else:
+                recommendations = [response]
+            rank = -1
+            doBreak = False
+            for goal in goals:
+                goalNotFound = True
+                for recommendationIndex, recommendation in enumerate(recommendations):
+                    foundGoal = False
+                    recommendationSubstring = recommendation.lower()
+                    firstIndex = recommendationSubstring.find(goal[0].lower())
+                    if firstIndex >= 0:
+                        recommendationSubstring = recommendationSubstring[
+                            (firstIndex + len(goal[0])) :
+                        ]
+                        secondIndex = recommendationSubstring.find(goal[1].lower())
+                        if secondIndex >= 0:
+                            recommendationSubstring = recommendationSubstring[
+                                (secondIndex + len(goal[1])) :
+                            ]
+                            foundGoal = (
+                                recommendationSubstring.find(
+                                    goal[2][: goal[2].find(" (")].lower()
+                                )
+                                >= 0
+                            )
+                    if foundGoal:
+                        goalNotFound = False
+                        truePositives[index] += 1
+                        if formatFollowed:
+                            falsePositives[index] -= 1
+                            if recommendationIndex < rank or rank == -1:
+                                rank = recommendationIndex
+                        else:
+                            rank = 0
+                            falseNegatives[index] += len(goals) - (goals.index(goal) + 1)
+                            doBreak = True
+                        recommendations.remove(recommendation)
+                        break
+                if goalNotFound:
+                    falseNegatives[index] += 1
+                if doBreak:
+                    break
+            falseNegatives[index] = max(
+                0, min(20 - truePositives[index], falseNegatives[index])
+            )
+            mrr[index] = 0
+            if rank >= 0:
+                mrr[index] += 1 / (rank + 1)
+                if index not in hits:
+                    hits[index] = [0] * len(recommendations)
+                elif len(hits[index]) < len(recommendations):
+                    hits[index] += [hits[index][-1]] * (
+                        len(recommendations) - len(hits[index])
+                    )
+                for i in range(rank, len(hits[index]), 1):
+                    hits[index][i] += 1
+            numDatapoints += 1
+    
+    total_time = time.time() - total_start
+    print(f"\n[TIMING] Total processing time: {total_time:.2f}s for {numDatapoints} datapoints ({total_time/numDatapoints:.2f}s per item)")
+    
     if saveResponses:
         with open(responsesPath, "w") as file:
             json.dump(responses, file)
             
-    if num_shots == 5:
-        print(f"Collected {len(all_conversations)} conversations and their extracted triples in-memory for {num_shots}-shot")
-    else:
-        print(f"Collected {len(all_conversations)} conversations (not persisting snippets/recommendations to disk)")
+    print(f"Collected {len(all_conversations)} conversations and their extracted triples")
     
     def getSumOfDictVals(dictionary):
         return sum(dictionary.values())
@@ -486,7 +527,35 @@ def runTests(dataset, shots=[], name=None, num_shots=0):
     )
 
 if __name__ == "__main__":
-    movieDataset = load_dataset("community-datasets/re_dial")["test"].to_list()
+    # Load datasets
+    movie_dataset = load_dataset("community-datasets/re_dial")
+    
+    # Check if test data already exists
+    test_json_exists = os.path.exists("stitched_conversations.json")
+    
+    if test_json_exists:
+        print("Found existing test data (stitched_conversations.json)")
+        print("Processing ONLY training data to avoid duplication...")
+        # Only process train data
+        movieDataset = movie_dataset["train"].to_list()
+        print(f"Training dataset size: {len(movieDataset)}")
+    else:
+        print("No existing test data found. Processing test + train...")
+        # Combine test + train (test first since you already processed it)
+        dataset = movie_dataset["test"].to_dict()
+        train_dataset = movie_dataset["train"].to_dict()
+        for key in dataset:
+            dataset[key].extend(train_dataset[key])
+        
+        # Convert back to list format
+        movieDataset = []
+        num_examples = len(dataset[list(dataset.keys())[0]])
+        for i in range(num_examples):
+            example = {key: dataset[key][i] for key in dataset.keys()}
+            movieDataset.append(example)
+        
+        print(f"Combined dataset size: {len(movieDataset)} (test + train)")
+    
     random.shuffle(movieDataset)
 
     numShots = 10
@@ -496,17 +565,17 @@ if __name__ == "__main__":
     else:
         testSet = movieDataset[numShots:]
 
-    print("Performing 5-Shot Test:")
+    print(f"Running {args.num_shots}-Shot Test on {len(testSet)} conversations:")
     stats_str, all_conversations, all_extracted_triples_per_conversation = runTests(
-        testSet, shots[:5], num_shots=5
+        testSet, shots[:args.num_shots], num_shots=args.num_shots, batch_size=args.batch_size
     )
-    print(f"5-Shot Scores:\n{stats_str}")
+    print(f"{args.num_shots}-Shot Scores:\n{stats_str}")
 
     stitched = []
     kept_indices = []  
     processed_count = 0
 
-    # Sort by the original index (ReDial order)
+    # Sort by the original index
     for index in sorted(all_conversations.keys()):
         conv = all_conversations[index]
         triples = all_extracted_triples_per_conversation.get(index, [])
@@ -533,19 +602,35 @@ if __name__ == "__main__":
     print(f"Processing complete! Processed {processed_count} conversations.")
     print(f"{'='*60}")
 
-    OUTPUT_FILE = "stitched_conversations.json"
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(stitched, f, indent=2, ensure_ascii=False)
-
-    print(f"\nStitched {len(stitched)} conversations into {OUTPUT_FILE}")
+    # Determine output files based on whether we're processing train only or full dataset
+    if os.path.exists("stitched_conversations.json"):
+        # Merge with existing test data
+        print("\nMerging with existing test data...")
+        with open("stitched_conversations.json", "r", encoding="utf-8") as f:
+            existing_test_data = json.load(f)
+        
+        # Combine: existing test + new train data
+        combined_stitched = existing_test_data + stitched
+        
+        OUTPUT_FILE = "stitched_conversations_full.json"
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            json.dump(combined_stitched, f, indent=2, ensure_ascii=False)
+        
+        print(f"\nCombined {len(existing_test_data)} test + {len(stitched)} train = {len(combined_stitched)} total conversations into {OUTPUT_FILE}")
+    else:
+        OUTPUT_FILE = "stitched_conversations_full.json"
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            json.dump(stitched, f, indent=2, ensure_ascii=False)
+        print(f"\nStitched {len(stitched)} conversations into {OUTPUT_FILE}")
 
     filtered_testSet = [testSet[i] for i in kept_indices]
-    with open("test_set.json", "w", encoding="utf-8") as f:
+    TEST_SET_FILE = "test_set_train.json" if os.path.exists("test_set.json") else "test_set_full.json"
+    with open(TEST_SET_FILE, "w", encoding="utf-8") as f:
         json.dump(filtered_testSet, f, indent=2, ensure_ascii=False)
 
-    print(f"Saved {len(filtered_testSet)} filtered conversations to test_set.json for evaluation")
+    print(f"Saved {len(filtered_testSet)} filtered conversations to {TEST_SET_FILE} for evaluation")
 
     evaluator = EvaluateAugmentedDataset(
-        stitched_path="stitched_conversations.json"
+        stitched_path=OUTPUT_FILE
     )
     metrics = evaluator.evaluate()
