@@ -1,319 +1,306 @@
+import argparse
 import json
 import os
+import math
 from datetime import datetime
 from datasets import load_dataset
+from tqdm import tqdm
 
 class EvaluateAugmentedDataset:
     """
     Compares the original dataset with the stitched augmented dataset.
-    Computes accuracy for 'liked', 'seen', and 'suggested' fields.
+    Computes Accuracy, Precision, Recall, and F1-Score for 'liked', 'seen', and 'suggested' fields.
     """
 
-    def __init__(self, original_dataset_path=None, stitched_path="stitched_conversations.json", save_path=None):
+    def __init__(self, original_dataset_path=None, stitched_path="augmented_full_dataset.json", save_path=None, args=None):
         """
         Args:
-            original_dataset_path (str or None): Path to the filtered original dataset. 
-                If None, attempts to load 'test_set.json' first, then falls back to full ReDial.
-            stitched_path (str): Path to the stitched JSON file.
-            save_path (str or None): Path to save the evaluation results. 
-                Defaults to '<stitched_dir>/evaluation_results.json'.
+            original_dataset_path (str or None): Path to the filtered original dataset (e.g., 'test_set.json').
+            stitched_path (str): Path to the augmented JSON file created by test.py.
+            save_path (str or None): Path to save the evaluation results.
+            args (argparse.Namespace): Parsed CLI args including --original_snippets_dir
         """
-        # Load stitched dataset first
+        self.args = args
+
+        # --- Load Stitched Dataset (The Model's Output) ---
+        if not os.path.exists(stitched_path):
+            raise FileNotFoundError(f"Stitched file not found: {stitched_path}")
+
         with open(stitched_path, "r", encoding="utf-8") as f:
             self.stitched_dataset = json.load(f)
-        
-        # Load original dataset with smart defaults
-        if original_dataset_path is None:
-            # Try to load the filtered test_set.json first
-            test_set_path = "test_set.json"
-            if os.path.exists(test_set_path):
-                print(f"Loading filtered test set from '{test_set_path}'...")
-                with open(test_set_path, "r", encoding="utf-8") as f:
-                    self.original_dataset = json.load(f)
-            else:
-                print("WARNING: 'test_set.json' not found. Loading full ReDial test split from HuggingFace...")
-                print("This may cause evaluation mismatches if conversations were filtered during processing.")
-                self.original_dataset = load_dataset("community-datasets/re_dial")["test"].to_list()
-        else:
+
+        # --- Load Original Dataset (Ground Truth) ---
+        self.original_dataset = []
+
+        # 1️⃣ Try loading from original_snippets_dir if flag present
+        if self.args.original_snippets_dir:
+            orig_dir = self.args.original_snippets_dir
+            print(f"Loading original conversations for ground truth from directory: {orig_dir}")
+
+            if not os.path.exists(orig_dir):
+                raise FileNotFoundError(f"Original snippets directory not found: {orig_dir}")
+
+            files = sorted([
+                f for f in os.listdir(orig_dir)
+                if os.path.isfile(os.path.join(orig_dir, f))
+            ])
+
+            for file in files:
+                path = os.path.join(orig_dir, file)
+                try:
+                    # Detect if JSON conversation or raw text
+                    with open(path, "r", encoding="utf-8") as fp:
+                        content = fp.read().strip()
+                        try:
+                            # attempt to parse JSON
+                            conv = json.loads(content)
+                            self.original_dataset.append(conv)
+                        except json.JSONDecodeError:
+                            # fallback to raw string
+                            self.original_dataset.append({"raw": content})
+                except Exception as e:
+                    print(f"ERROR loading {file}: {e}")
+
+            print(f"Loaded {len(self.original_dataset)} original conversations from directory.")
+
+            # Align size with augmented
+            num_snippets = len(self.original_dataset)
+            num_aug = len(self.stitched_dataset)
+
+            num_shots_skipped = num_snippets - num_aug
+            if 0 < num_shots_skipped < num_snippets:
+                print(f"Skipping the first {num_shots_skipped} conversations in original data to match augmented (generator skipped shots).")
+                self.original_dataset = self.original_dataset[num_shots_skipped:]
+            elif num_shots_skipped <= 0:
+                print("No conversations were skipped or sizes identical.")
+
+            if len(self.original_dataset) > num_aug:
+                self.original_dataset = self.original_dataset[:num_aug]
+
+        # 2️⃣ Else try test_set.json
+        elif original_dataset_path:
             print(f"Loading original dataset from '{original_dataset_path}'...")
             with open(original_dataset_path, "r", encoding="utf-8") as f:
                 self.original_dataset = json.load(f)
 
+        elif os.path.exists("test_set.json"):
+            print("Loading original conversations from 'test_set.json'...")
+            with open("test_set.json", "r", encoding="utf-8") as f:
+                self.original_dataset = json.load(f)
+
+        # 3️⃣ Else fallback to full HF load
+        else:
+            print("WARNING: No comparison file found, loading FULL ReDial dataset from HuggingFace for ground truth...")
+            redial = load_dataset("community-datasets/re_dial")
+            for split in ["train", "test", "validation"]:
+                if split in redial:
+                    self.original_dataset.extend(redial[split].to_list())
+
+            # Align size
+            num_shots_skipped = len(self.original_dataset) - len(self.stitched_dataset)
+            if 0 < num_shots_skipped < len(self.original_dataset):
+                print(f"Skipping first {num_shots_skipped} conversations to match augmented size.")
+                self.original_dataset = self.original_dataset[num_shots_skipped:]
+            else:
+                print("No conversations were skipped or sizes identical.")
+
+        # --- Save path naming logic ---
+        base_json_name = os.path.basename(os.path.abspath(stitched_path))
         self.save_path = save_path or os.path.join(
             os.path.dirname(os.path.abspath(stitched_path)),
-            "evaluation_results.json"
+            "evaluation_results_" + os.path.splitext(base_json_name)[0] + ".json"
         )
 
         print(f"Loaded {len(self.original_dataset)} original and {len(self.stitched_dataset)} stitched conversations.")
-        
-        # Verify dataset alignment
-        if len(self.original_dataset) != len(self.stitched_dataset):
-            print(f"\nWARNING: Dataset size mismatch!")
-            print(f"  - Original: {len(self.original_dataset)} conversations")
-            print(f"  - Stitched: {len(self.stitched_dataset)} conversations")
-            print(f"  - Will only evaluate the first {min(len(self.original_dataset), len(self.stitched_dataset))} conversations")
-            print(f"  - This may indicate that conversations were filtered during augmentation.\n")
-        
         print(f"Results will be saved to: {self.save_path}")
 
     def _extract_answers(self, conversation):
-        """Return the active list of answers (initiator or respondent)."""
-        if conversation.get("initiatorQuestions"):
-            return conversation["initiatorQuestions"]
-        return conversation.get("respondentQuestions", [])
+        # If conversation is a list, search inside it (fallback)
+        if isinstance(conversation, list):
+            for item in conversation:
+                if isinstance(item, dict) and "initiatorQuestions" in item:
+                    return item["initiatorQuestions"]
+                if isinstance(item, dict) and "respondentQuestions" in item:
+                    return item["respondentQuestions"]
+            return []  # nothing found
+
+        # Normal case: conversation is a dict
+        if isinstance(conversation, dict):
+            if "initiatorQuestions" in conversation:
+                return conversation["initiatorQuestions"]
+            if "respondentQuestions" in conversation:
+                return conversation["respondentQuestions"]
+            if "movieId" in conversation:
+                return [conversation]  # allow single-answer fallback
+
+        return []
+
 
     def _compare_answers(self, original_answers, stitched_answers):
         """
-        Compare answers movie-by-movie for liked/seen/suggested accuracy.
-        Also tracks true positives, false positives, and false negatives for precision/recall.
+        Compare annotations for a single conversation. Now INCLUDES label = 2.
         """
-        # Accuracy tracking
-        correct_liked, total_liked = 0, 0
-        correct_seen, total_seen = 0, 0
-        correct_suggested, total_suggested = 0, 0
-        
-        # Precision/Recall tracking
-        tp_liked, fp_liked, fn_liked = 0, 0, 0
-        tp_seen, fp_seen, fn_seen = 0, 0, 0
-        tp_suggested, fp_suggested, fn_suggested = 0, 0, 0
 
-        stitched_lookup = {a["movieId"]: a for a in stitched_answers if "movieId" in a}
-        orig_lookup = {a["movieId"]: a for a in original_answers if "movieId" in a}
+        if not isinstance(original_answers, list):
+            return {"liked":{"tp":0,"fp":0,"fn":0,"correct":0,"total":0},
+                    "seen":{"tp":0,"fp":0,"fn":0,"correct":0,"total":0},
+                    "suggested":{"tp":0,"fp":0,"fn":0,"correct":0,"total":0}}
 
-        # Process all movies in original (for recall - finding ground truth)
-        for orig in original_answers:
-            movie_id = orig.get("movieId")
-            stitched = stitched_lookup.get(movie_id, {})
+        if not isinstance(stitched_answers, list):
+            stitched_answers = []
 
-            # Compare liked
-            if "liked" in orig and orig["liked"] != 2:
-                total_liked += 1
-                if stitched.get("liked") == orig["liked"]:
-                    correct_liked += 1
-                    tp_liked += 1
-                else:
-                    fn_liked += 1  # Ground truth exists but not predicted correctly
+        # --- 1️⃣ Build Ground Truth map (INCLUDES 2) ---
+        orig_map = {}
+        stitched_map = {}
 
-            # Compare seen
-            if "seen" in orig and orig["seen"] != 2:
-                total_seen += 1
-                if stitched.get("seen") == orig["seen"]:
-                    correct_seen += 1
-                    tp_seen += 1
-                else:
-                    fn_seen += 1
+        for a in original_answers:
+            if isinstance(a, dict) and "movieId" in a:
+                orig_map[a["movieId"]] = {
+                    "liked": a.get("liked"),
+                    "seen": a.get("seen"),
+                    "suggested": a.get("suggested")
+                }
 
-            # Compare suggested
-            if "suggested" in orig and orig["suggested"] != 2:
-                total_suggested += 1
-                if stitched.get("suggested") == orig["suggested"]:
-                    correct_suggested += 1
-                    tp_suggested += 1
-                else:
-                    fn_suggested += 1
-        
-        # Process movies only in stitched (for precision - false positives)
-        for stitched in stitched_answers:
-            movie_id = stitched.get("movieId")
-            if movie_id not in orig_lookup:
-                # Movie predicted but not in ground truth
-                if "liked" in stitched and stitched["liked"] != 2:
-                    fp_liked += 1
-                if "seen" in stitched and stitched["seen"] != 2:
-                    fp_seen += 1
-                if "suggested" in stitched and stitched["suggested"] != 2:
-                    fp_suggested += 1
+        for a in stitched_answers:
+            if isinstance(a, dict) and "movieId" in a:
+                stitched_map[a["movieId"]] = {
+                    "liked": a.get("liked"),
+                    "seen": a.get("seen"),
+                    "suggested": a.get("suggested")
+                }
 
-        return {
-            "liked": (correct_liked, total_liked),
-            "seen": (correct_seen, total_seen),
-            "suggested": (correct_suggested, total_suggested),
-            "tp_liked": tp_liked,
-            "fp_liked": fp_liked,
-            "fn_liked": fn_liked,
-            "tp_seen": tp_seen,
-            "fp_seen": fp_seen,
-            "fn_seen": fn_seen,
-            "tp_suggested": tp_suggested,
-            "fp_suggested": fp_suggested,
-            "fn_suggested": fn_suggested,
+        # --- 3️⃣ Initialize metric counters ---
+        res = {
+            "liked": {"tp": 0, "fp": 0, "fn": 0, "correct": 0, "total": 0},
+            "seen": {"tp": 0, "fp": 0, "fn": 0, "correct": 0, "total": 0},
+            "suggested": {"tp": 0, "fp": 0, "fn": 0, "correct": 0, "total": 0},
         }
+        # print( "Printing original: ", orig_map )
+        # print( "Printing stitched: ", stitched_map )
+
+        # if orig_map.keys() != stitched_map.keys():
+        #     print( "Printing original: ", orig_map )
+        #     print( "Printing stitched: ", stitched_map )
+        # --- 4️⃣ Compare movie-by-movie ---
+        all_ids = set(orig_map.keys()) | set(stitched_map.keys())
+
+        for mid in all_ids:
+            orig = orig_map.get(mid, {})
+            pred = stitched_map.get(mid, {})
+
+            for f in ["liked", "seen", "suggested"]:
+                o = orig.get(f)
+                p = pred.get(f)
+
+                if o is not None and o < 2: # GT check
+                    res[f]["total"] += 1   # count it toward total GT labels
+                    if p is not None and p < 2: # both have labels, 2 means we don't have data so can't count our detections towards it
+                        if p == o: # check if the prediction matches what the GT is
+                            res[f]["tp"] += 1
+                            res[f]["correct"] += 1
+                        else:                  # model got it wrong
+                            res[f]["fn"] += 1
+
+                    else:        # model predicted a label that GT did not have → FP
+                        res[f]["fn"] += 1
+                elif p is not None and p < 2:
+                    res[f]["fp"] += 1
+        return res
+
 
     def evaluate(self):
-        """
-        Evaluate stitched dataset against original dataset.
-        Computes accuracy, precision, and recall.
-        Saves and returns dict with all metrics.
-        """
-        liked_correct = seen_correct = suggested_correct = 0
-        liked_total = seen_total = suggested_total = 0
-        
-        # Precision/Recall counters
-        tp_liked_total = fp_liked_total = fn_liked_total = 0
-        tp_seen_total = fp_seen_total = fn_seen_total = 0
-        tp_suggested_total = fp_suggested_total = fn_suggested_total = 0
-        
-        # Track per-conversation results for debugging
-        mismatches = []
-        
-        # Only evaluate up to the minimum length to handle size mismatches
-        num_to_evaluate = min(len(self.original_dataset), len(self.stitched_dataset))
-
-        for idx in range(num_to_evaluate):
-            orig_conv = self.original_dataset[idx]
-            stitched_conv = self.stitched_dataset[idx]
-            
-            # Optional: Verify conversation IDs match if available
-            if "_original_conversation_id" in stitched_conv and "conversationId" in orig_conv:
-                if stitched_conv["_original_conversation_id"] != orig_conv["conversationId"]:
-                    print(f"WARNING: Conversation ID mismatch at index {idx}!")
-                    print(f"  - Original ID: {orig_conv['conversationId']}")
-                    print(f"  - Stitched ID: {stitched_conv['_original_conversation_id']}")
-                    mismatches.append(idx)
-            
-            stitched_answers = self._extract_answers(stitched_conv)
-            original_answers = self._extract_answers(orig_conv)
-
-            result = self._compare_answers(original_answers, stitched_answers)
-            
-            # Accuracy counts
-            liked_correct += result["liked"][0]
-            liked_total += result["liked"][1]
-            seen_correct += result["seen"][0]
-            seen_total += result["seen"][1]
-            suggested_correct += result["suggested"][0]
-            suggested_total += result["suggested"][1]
-            
-            # Precision/Recall counts
-            tp_liked_total += result["tp_liked"]
-            fp_liked_total += result["fp_liked"]
-            fn_liked_total += result["fn_liked"]
-            tp_seen_total += result["tp_seen"]
-            fp_seen_total += result["fp_seen"]
-            fn_seen_total += result["fn_seen"]
-            tp_suggested_total += result["tp_suggested"]
-            fp_suggested_total += result["fp_suggested"]
-            fn_suggested_total += result["fn_suggested"]
-
-        def safe_div(a, b):
-            return round(a / b, 3) if b > 0 else 0.0
-        
-        # Calculate precision and recall for each field
-        liked_precision = safe_div(tp_liked_total, tp_liked_total + fp_liked_total)
-        liked_recall = safe_div(tp_liked_total, tp_liked_total + fn_liked_total)
-        liked_f1 = safe_div(2 * liked_precision * liked_recall, liked_precision + liked_recall)
-        
-        seen_precision = safe_div(tp_seen_total, tp_seen_total + fp_seen_total)
-        seen_recall = safe_div(tp_seen_total, tp_seen_total + fn_seen_total)
-        seen_f1 = safe_div(2 * seen_precision * seen_recall, seen_precision + seen_recall)
-        
-        suggested_precision = safe_div(tp_suggested_total, tp_suggested_total + fp_suggested_total)
-        suggested_recall = safe_div(tp_suggested_total, tp_suggested_total + fn_suggested_total)
-        suggested_f1 = safe_div(2 * suggested_precision * suggested_recall, suggested_precision + suggested_recall)
-        
-        # Overall metrics
-        overall_tp = tp_liked_total + tp_seen_total + tp_suggested_total
-        overall_fp = fp_liked_total + fp_seen_total + fp_suggested_total
-        overall_fn = fn_liked_total + fn_seen_total + fn_suggested_total
-        
-        overall_precision = safe_div(overall_tp, overall_tp + overall_fp)
-        overall_recall = safe_div(overall_tp, overall_tp + overall_fn)
-        overall_f1 = safe_div(2 * overall_precision * overall_recall, overall_precision + overall_recall)
-
-        metrics = {
-            # Accuracy metrics
-            "liked_accuracy": safe_div(liked_correct, liked_total),
-            "liked_correct": liked_correct,
-            "liked_total": liked_total,
-            "seen_accuracy": safe_div(seen_correct, seen_total),
-            "seen_correct": seen_correct,
-            "seen_total": seen_total,
-            "suggested_accuracy": safe_div(suggested_correct, suggested_total),
-            "suggested_correct": suggested_correct,
-            "suggested_total": suggested_total,
-            "overall_accuracy": safe_div(
-                liked_correct + seen_correct + suggested_correct,
-                liked_total + seen_total + suggested_total
-            ),
-            "overall_correct": liked_correct + seen_correct + suggested_correct,
-            "overall_total": liked_total + seen_total + suggested_total,
-            
-            # Precision/Recall metrics for liked
-            "liked_precision": liked_precision,
-            "liked_recall": liked_recall,
-            "liked_f1": liked_f1,
-            "liked_tp": tp_liked_total,
-            "liked_fp": fp_liked_total,
-            "liked_fn": fn_liked_total,
-            
-            # Precision/Recall metrics for seen
-            "seen_precision": seen_precision,
-            "seen_recall": seen_recall,
-            "seen_f1": seen_f1,
-            "seen_tp": tp_seen_total,
-            "seen_fp": fp_seen_total,
-            "seen_fn": fn_seen_total,
-            
-            # Precision/Recall metrics for suggested
-            "suggested_precision": suggested_precision,
-            "suggested_recall": suggested_recall,
-            "suggested_f1": suggested_f1,
-            "suggested_tp": tp_suggested_total,
-            "suggested_fp": fp_suggested_total,
-            "suggested_fn": fn_suggested_total,
-            
-            # Overall precision/recall
-            "overall_precision": overall_precision,
-            "overall_recall": overall_recall,
-            "overall_f1": overall_f1,
-            "overall_tp": overall_tp,
-            "overall_fp": overall_fp,
-            "overall_fn": overall_fn,
-            
-            # Meta information
-            "conversations_evaluated": num_to_evaluate,
-            "conversations_with_id_mismatch": len(mismatches),
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        global_metrics = {
+            "liked": {"tp": 0, "fp": 0, "fn": 0, "correct": 0, "total": 0},
+            "seen": {"tp": 0, "fp": 0, "fn": 0, "correct": 0, "total": 0},
+            "suggested": {"tp": 0, "fp": 0, "fn": 0, "correct": 0, "total": 0},
         }
 
-        print("\n" + "="*80)
-        print("EVALUATION RESULTS".center(80))
-        print("="*80)
+        n = min(len(self.original_dataset), len(self.stitched_dataset))
         
-        print(f"\nConversations Evaluated: {metrics['conversations_evaluated']}")
-        if mismatches:
-            print(f"⚠️  Conversations with ID mismatches: {len(mismatches)}")
-            print(f"   Indices: {mismatches[:10]}" + (" ..." if len(mismatches) > 10 else ""))
-        
-        print(f"\n{'Metric':<15} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1':<10} {'Correct/Total'}")
-        print("-" * 80)
-        print(f"{'Liked':<15} {metrics['liked_accuracy']:.3f}      {metrics['liked_precision']:.3f}      {metrics['liked_recall']:.3f}      {metrics['liked_f1']:.3f}      {metrics['liked_correct']}/{metrics['liked_total']}")
-        print(f"{'Seen':<15} {metrics['seen_accuracy']:.3f}      {metrics['seen_precision']:.3f}      {metrics['seen_recall']:.3f}      {metrics['seen_f1']:.3f}      {metrics['seen_correct']}/{metrics['seen_total']}")
-        print(f"{'Suggested':<15} {metrics['suggested_accuracy']:.3f}      {metrics['suggested_precision']:.3f}      {metrics['suggested_recall']:.3f}      {metrics['suggested_f1']:.3f}      {metrics['suggested_correct']}/{metrics['suggested_total']}")
-        print("-" * 80)
-        print(f"{'Overall':<15} {metrics['overall_accuracy']:.3f}      {metrics['overall_precision']:.3f}      {metrics['overall_recall']:.3f}      {metrics['overall_f1']:.3f}      {metrics['overall_correct']}/{metrics['overall_total']}")
-        
-        print("\n" + "Detailed Counts".center(80))
-        print("-" * 80)
-        print(f"{'Metric':<15} {'True Positives':<18} {'False Positives':<18} {'False Negatives':<18}")
-        print("-" * 80)
-        print(f"{'Liked':<15} {metrics['liked_tp']:<18} {metrics['liked_fp']:<18} {metrics['liked_fn']:<18}")
-        print(f"{'Seen':<15} {metrics['seen_tp']:<18} {metrics['seen_fp']:<18} {metrics['seen_fn']:<18}")
-        print(f"{'Suggested':<15} {metrics['suggested_tp']:<18} {metrics['suggested_fp']:<18} {metrics['suggested_fn']:<18}")
-        print("-" * 80)
-        print(f"{'Overall':<15} {metrics['overall_tp']:<18} {metrics['overall_fp']:<18} {metrics['overall_fn']:<18}")
-        print("="*80 + "\n")
+        for datapoint in tqdm(self.original_dataset, desc="Evaluating Results"):
+            o = datapoint
+            s = None
+            r = None
+            curr_conv = o[0].get("conversationId")
+            
+            for testpoint in (self.stitched_dataset):
+                if testpoint.get("conversationId") == curr_conv:
+                    s = testpoint
+                    break
+            if s is not None:
+                r = self._compare_answers(self._extract_answers(o), self._extract_answers(s))
+            
+            for f in ["liked", "seen", "suggested"]:
+                for k in global_metrics[f]:
+                    global_metrics[f][k] += r[f][k]
 
-        # Save metrics to JSON file
-        with open(self.save_path, "w", encoding="utf-8") as f:
-            json.dump(metrics, f, indent=4)
-        print(f"✅ Saved evaluation results to '{self.save_path}'")
+        # for i in tqdm(range(n), desc="Evaluating Conversations"):
+        #     o = self.original_dataset[i]
+        #     print(curr_conv)
+        #     s = self.stitched_dataset[i]
+        #     print("o", o)
+        #     print("s", s)
+        #     r = self._compare_answers(self._extract_answers(o), self._extract_answers(s))
+        #     # print( r )
+        #     for f in ["liked", "seen", "suggested"]:
+        #         for k in global_metrics[f]:
+        #             global_metrics[f][k] += r[f][k]
 
-        return metrics
+        def sd(a, b): return round(a/b,4) if b else 0.0
+        fm, otp, ofp, ofn, oc, ot = {}, 0,0,0,0,0
+        for f in ["liked","seen","suggested"]:
+            m = global_metrics[f]
+            acc = sd(m["correct"], m["total"])
+            pr = sd(m["tp"], m["tp"]+m["fp"])
+            rc = sd(m["tp"], m["tp"]+m["fn"])
+            f1 = sd(2*pr*rc, pr+rc) if (pr+rc) else 0.0
+            fm.update({f"{f}_accuracy":acc, f"{f}_precision":pr, f"{f}_recall":rc, f"{f}_f1":f1,
+                       f"{f}_tp":m["tp"], f"{f}_fp":m["fp"], f"{f}_fn":m["fn"]})
+            otp+=m["tp"];ofp+=m["fp"];ofn+=m["fn"];oc+=m["correct"];ot+=m["total"]
 
+        fm.update({"overall_accuracy": sd(oc,ot),
+                   "overall_precision": sd(otp,otp+ofp),
+                   "overall_recall": sd(otp,otp+ofn),
+                   "overall_f1": sd(2*sd(otp,otp+ofp)*sd(otp,otp+ofn),
+                                    sd(otp,otp+ofp)+sd(otp,otp+ofn)) if (otp+ofp+ofn) else 0,
+                   "overall_tp":otp,"overall_fp":ofp,"overall_fn":ofn,
+                   "conversations_evaluated":n,"timestamp":datetime.now().isoformat()})
+
+        print(f"\nSaving evaluation results to: {self.save_path}")
+        os.makedirs(os.path.dirname(self.save_path) or '.', exist_ok=True)
+        with open(self.save_path,"w",encoding="utf-8") as f: json.dump(fm,f,indent=4)
+        return fm
+
+def print_results(metrics):
+    print("\n" + "="*80)
+    print("✨ AUGMENTED DATASET EVALUATION RESULTS ✨")
+    print(f"Conversations Evaluated: {metrics['conversations_evaluated']}")
+    print("="*80)
+    print(f"{'Field':<10} | {'Acc':>6} | {'Prec':>6} | {'Rec':>6} | {'F1':>6} | {'TP':>6} | {'FP':>6} | {'FN':>6}")
+    print("-"*80)
+    for f in ["liked","seen","suggested"]:
+        print(f"{f:<10} | {metrics[f'{f}_accuracy']:>6.4f} | {metrics[f'{f}_precision']:>6.4f} | "
+              f"{metrics[f'{f}_recall']:>6.4f} | {metrics[f'{f}_f1']:>6.4f} | "
+              f"{metrics[f'{f}_tp']:>6} | {metrics[f'{f}_fp']:>6} | {metrics[f'{f}_fn']:>6}")
+    print("="*80)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--original_snippets_dir", type=str, default="runs/Qwen3-0.6B_0shot/original_snippets",
+                        help="Directory containing 1 file per original conversation in processing order.")
+    parser.add_argument("--stitched_path", type=str,
+                        default="runs/Qwen3-0.6B_0shot/augmented_0.6B.json",
+                        help="Path to stitched augmented dataset JSON.")
+    parser.add_argument("--save_path", type=str, default=None,
+                        help="Optional custom path to save results.")
+
+    args = parser.parse_args()
+
     evaluator = EvaluateAugmentedDataset(
-        stitched_path="stitched_conversations.json"
+        stitched_path=args.stitched_path,
+        original_dataset_path=None,
+        save_path=args.save_path,
+        args=args
     )
-    metrics = evaluator.evaluate()
+    res = evaluator.evaluate()
+    print_results(res)

@@ -3,23 +3,20 @@ import os
 import re
 import shutil
 from glob import glob
+import urllib.parse
 
 '''
-I have added logic to test.py to save recommendations to a directory for later use. 
+Enhanced version with robust fuzzy name matching.
+Uses URL decoding and whitespace normalization for reliable movie name matching.
 
-This script will take the saved recommendations and also do some parenthesis parsing to make sure it is safe to use for triples. It will reference the recommendations and then 
-look at the appropriate conversation saved in original_snippets to update the ground truth. It works on initiatorQuestions if the field has data, otherwise uses respondentQuestions.
-Currently it is only running on 5 shot results for testing but should do fine with varied number of shots and increasing number of conversations. What it runs on depends on what
-test.py was run on. I ran it as python test.py --num_test_points 3 to get 3 conversations. There is added logic in test.py currently to only save 5 shot versions of recommendations. This 
-can be removed to get more recommendations and original snippets. 
+This script takes saved recommendations and updates ground truth.
 
-Naming convention for recommendations is {shot number}shots_{conversation number}.json
-Naming convention for original snippets is original_ReDial_snippet_{shot number}shots_{conversation number}.json
-Naming convention for augmented datasets is updated_ReDial_from_{shot number}shots_{conversation number}.json
+Naming conventions:
+- Recommendations: {shot_number}shots_{conversation_number}.json
+- Snippets: original_ReDial_snippet_{shot_number}shots_{conversation_number}.json
+- Output: updated_ReDial_from_{shot_number}shots_{conversation_number}.json
 
-Run the script using python augmentedDataset.py
-
-Currently, the updates are not very robust since it's all dependent on the triples extracted. This means we have a lot of '2s' coming through in the updated dataset.
+Usage: python augmentDataset.py
 '''
 
 class AugmentDataset:
@@ -27,12 +24,20 @@ class AugmentDataset:
         self.conversation = None 
         self.extracted_triples = []
 
+    def normalize_movie_name(self, name):
+        """Normalize movie names for robust fuzzy matching"""
+        if not name:
+            return ""
+        name = urllib.parse.unquote(name)  # Handle URL encoding (%3F -> ?)
+        name = name.lower().strip()
+        name = re.sub(r'\s+', ' ', name)  # Normalize multiple spaces to single space
+        return name
+
     def load_conversation_from_snippet(self, path):
         """Load the conversation from the original_snippets file"""
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         
-        # The snippet file contains a list with one conversation
         if isinstance(data, list) and len(data) > 0:
             self.conversation = data[0]
         else:
@@ -47,7 +52,6 @@ class AugmentDataset:
         if not self.extracted_triples:
             raise ValueError("No triples loaded.")
 
-        # Choose initiatorQuestions, or respondentQuestions if initiator is empty
         answers = (
             self.conversation["initiatorQuestions"]
             if self.conversation.get("initiatorQuestions")
@@ -66,24 +70,32 @@ class AugmentDataset:
         for triple in self.extracted_triples:
             print(f"  {triple}")
 
-        # Helper: map movie names in triples to IDs
-        def find_movie_id_from_obj(obj_value: str):
-            obj_clean = obj_value.strip().lower()
-            for movie_id, movie_name in movie_mentions.items():
-                if movie_name.strip().lower() in obj_clean:
-                    return movie_id
-            return None
-
-        # Build triples that reference movie IDs instead of names
-        triples_with_ids = []
+        # Build lookup: movieId -> list of relations using fuzzy name matching
+        movie_relations = {}
+        
         for subj, relation, obj in self.extracted_triples:
-            movie_id = find_movie_id_from_obj(obj)
+            movie_id = None
+            
+            # Fuzzy name matching with normalization
+            obj_normalized = self.normalize_movie_name(obj)
+            
+            for mid, mname in movie_mentions.items():
+                mname_normalized = self.normalize_movie_name(mname)
+                
+                # Bidirectional substring matching
+                if mname_normalized in obj_normalized or obj_normalized in mname_normalized:
+                    movie_id = mid
+                    print(f"  ✓ Matched ID {movie_id}: '{obj}' -> '{mname}'")
+                    break
+            
             if movie_id:
-                triples_with_ids.append((subj.lower(), relation.lower(), movie_id))
+                if movie_id not in movie_relations:
+                    movie_relations[movie_id] = []
+                movie_relations[movie_id].append(relation.lower())
             else:
-                print(f" No movieId found for triple object: {obj}")
+                print(f"  ✗ No movieId found for triple object: {obj}")
 
-        # Update conversation entries using movieId-based matching
+        # Update conversation entries using exact movieId matching
         for answer in answers:
             answer["suggested"] = 2
             answer["seen"] = 2
@@ -96,29 +108,28 @@ class AugmentDataset:
 
             print(f"\nDEBUG: Checking movie ID {movie_id}: {movie_name}")
 
-            matched_triples = [t for t in triples_with_ids if t[2] == movie_id]
+            relations = movie_relations.get(movie_id, [])
 
-            if matched_triples:
-                print(f"  MATCHED RELATIONS: {[r for (_, r, _) in matched_triples]}")
+            if relations:
+                print(f"  MATCHED RELATIONS: {relations}")
 
-            for _, relation, _ in matched_triples:
-                if relation in ("wassuggested", "suggested"):
-                    answer["suggested"] = 1
-                elif relation == "likes":
-                    answer["liked"] = 1
-                elif relation in ("dislikes", "hated", "didntlike"):
-                    answer["liked"] = 0
-                elif relation == "seen":
-                    answer["seen"] = 1
-                elif relation == "notseen":
-                    answer["seen"] = 0
-
-            if not matched_triples:
+                for relation in relations:
+                    if relation in ("wassuggested", "suggested"):
+                        answer["suggested"] = 1
+                    elif relation == "likes":
+                        answer["liked"] = 1
+                        answer["seen"] = 1
+                    elif relation in ("dislikes", "hated", "didntlike", "disliked"):
+                        answer["liked"] = 0
+                        answer["seen"] = 1
+                    elif relation == "seen":
+                        answer["seen"] = 1
+                    elif relation in ("notseen", "unseen"):
+                        answer["seen"] = 0
+            else:
                 print(f"  NO MATCHES found for movie ID {movie_id}")
 
-        print(f"\n Updated conversation with {len(triples_with_ids)} mapped triples")
-
-
+        print(f"\nUpdated conversation with {len(self.extracted_triples)} mapped triples")
 
     def save_updated_conversation(self, path):
         """Save the updated conversation"""
@@ -131,24 +142,23 @@ class AugmentDataset:
         if isinstance(conversation_obj, dict):
             self.conversation = conversation_obj
         elif isinstance(conversation_obj, list) and len(conversation_obj) > 0 and isinstance(conversation_obj[0], dict):
-            # sometimes callers may pass a single-element list containing the conversation
             self.conversation = conversation_obj[0]
         else:
             raise ValueError("Invalid conversation object provided")
         print("Loaded conversation from in-memory object")
 
     def load_triples_from_list(self, raw_triples):
-        """Load extracted triples from an in-memory list (no file IO).
-
-        raw_triples may be a list of strings like "(User, likes, Movie (2017))"
-        or a list of 3-tuples/lists.
+        """Load extracted triples with robust parsing.
+        
+        Expected format: "(User, likes, Movie Name (Year))"
         """
         converted_triples = []
+        
         for triple in raw_triples:
             if isinstance(triple, str):
                 triple_clean = triple.strip()
 
-                # Fix global imbalance first
+                # Fix global parenthesis imbalance
                 open_parens = triple_clean.count("(")
                 close_parens = triple_clean.count(")")
                 if open_parens > close_parens:
@@ -156,11 +166,11 @@ class AugmentDataset:
                 elif close_parens > open_parens:
                     triple_clean = "(" * (close_parens - open_parens) + triple_clean
 
-                # Remove surrounding parentheses if they wrap the entire triple
+                # Remove outer parentheses wrapping the entire triple
                 if triple_clean.startswith("(") and triple_clean.endswith(")"):
                     triple_clean = triple_clean[1:-1]
 
-                # Split by comma (into at most 3 parts)
+                # Split by comma (max 3 parts to handle movie titles with commas)
                 parts = triple_clean.split(",", 2)
 
                 if len(parts) == 3:
@@ -168,25 +178,27 @@ class AugmentDataset:
                     relation = parts[1].strip(" ()\"")
                     obj = parts[2].strip(" ()\"")
 
-                    # Fix missing parentheses in movie titles "Get Out (2017"
+                    # Fix missing parentheses in movie titles like "Get Out (2017"
                     if obj.count("(") > obj.count(")"):
                         obj += ")" * (obj.count("(") - obj.count(")"))
                     elif obj.count(")") > obj.count("("):
-                        obj = "(" * (obj.count(")") - obj.count("(") ) + obj
+                        obj = "(" * (obj.count(")") - obj.count("(")) + obj
 
                     converted_triples.append([subject, relation, obj])
                 else:
-                    print(f"Skipping malformed triple (after fix): {triple_clean}")
+                    print(f"Skipping malformed triple (wrong number of parts): {triple_clean}")
 
             elif isinstance(triple, (list, tuple)) and len(triple) == 3:
                 subj, rel, obj = triple
                 subj, rel, obj = str(subj), str(rel), str(obj)
+                
+                # Fix parenthesis imbalance
                 if obj.count("(") > obj.count(")"):
                     obj += ")" * (obj.count("(") - obj.count(")"))
                 elif obj.count(")") > obj.count("("):
-                    obj = "(" * (obj.count(")") - obj.count("(") ) + obj
+                    obj = "(" * (obj.count(")") - obj.count("(")) + obj
+                
                 converted_triples.append([subj, rel, obj])
-
             else:
                 print(f"Skipping malformed triple: {triple}")
 
@@ -194,3 +206,130 @@ class AugmentDataset:
         print(f"Loaded {len(self.extracted_triples)} valid triple(s) from in-memory list")
 
 
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Augment ReDial conversations using extracted triples with fuzzy name matching"
+    )
+    parser.add_argument(
+        "--recommendations_dir",
+        type=str,
+        default="recommendations",
+        help="Directory containing recommendation JSON files"
+    )
+    parser.add_argument(
+        "--snippets_dir",
+        type=str,
+        default="original_snippets",
+        help="Directory containing original snippet JSON files"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="augmented_conversations",
+        help="Directory to save augmented conversations"
+    )
+    parser.add_argument(
+        "--num_shots",
+        type=str,
+        default="1shot",
+        help="Shot configuration to process (e.g., '1shot', '5shot')"
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detailed debug information"
+    )
+    
+    args = parser.parse_args()
+    
+    print("="*60)
+    print("ReDial Dataset Augmentation - Fuzzy Name Matching")
+    print("="*60)
+    print(f"Recommendations dir: {args.recommendations_dir}")
+    print(f"Snippets dir: {args.snippets_dir}")
+    print(f"Output dir: {args.output_dir}")
+    print(f"Shot configuration: {args.num_shots}")
+    print("="*60)
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    recommendation_pattern = os.path.join(
+        args.recommendations_dir, 
+        f"{args.num_shots}_*.json"
+    )
+    recommendation_files = sorted(glob(recommendation_pattern))
+    
+    if not recommendation_files:
+        print(f"\nERROR: No files found matching: {recommendation_pattern}")
+        print("Run test.py with --save_for_augmentation first")
+        exit(1)
+    
+    print(f"\nFound {len(recommendation_files)} recommendation files")
+    
+    num_processed = 0
+    num_failed = 0
+    num_no_triples = 0
+    
+    for rec_file in recommendation_files:
+        try:
+            basename = os.path.basename(rec_file)
+            index = basename.replace(f"{args.num_shots}_", "").replace(".json", "")
+            
+            snippet_file = os.path.join(
+                args.snippets_dir,
+                f"original_ReDial_snippet_{args.num_shots}_{index}.json"
+            )
+            
+            if not os.path.exists(snippet_file):
+                print(f"Warning: Snippet not found: {snippet_file}")
+                num_failed += 1
+                continue
+            
+            with open(rec_file, "r", encoding="utf-8") as f:
+                triples = json.load(f)
+            
+            if not triples:
+                if args.verbose:
+                    print(f"No triples in {basename}")
+                num_no_triples += 1
+                continue
+            
+            augmenter = AugmentDataset()
+            augmenter.load_conversation_from_snippet(snippet_file)
+            augmenter.load_triples_from_list(triples)
+            
+            if not args.verbose:
+                import sys
+                from io import StringIO
+                old_stdout = sys.stdout
+                sys.stdout = StringIO()
+            
+            augmenter.update_conversation()
+            
+            if not args.verbose:
+                sys.stdout = old_stdout
+            
+            output_file = os.path.join(
+                args.output_dir,
+                f"updated_ReDial_from_{args.num_shots}_{index}.json"
+            )
+            augmenter.save_updated_conversation(output_file)
+            
+            num_processed += 1
+            
+            if args.verbose:
+                print(f"✓ Processed conversation {index}")
+            
+        except Exception as e:
+            print(f"\nError processing {rec_file}: {e}")
+            num_failed += 1
+    
+    print(f"\n{'='*60}")
+    print("Processing Complete!")
+    print(f"{'='*60}")
+    print(f"Successfully processed: {num_processed}")
+    print(f"No triples found: {num_no_triples}")
+    print(f"Failed: {num_failed}")
+    print(f"{'='*60}")
