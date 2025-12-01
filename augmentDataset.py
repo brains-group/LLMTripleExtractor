@@ -118,10 +118,8 @@ class AugmentDataset:
                         answer["suggested"] = 1
                     elif relation == "likes":
                         answer["liked"] = 1
-                        answer["seen"] = 1
                     elif relation in ("dislikes", "hated", "didntlike", "disliked"):
                         answer["liked"] = 0
-                        answer["seen"] = 1
                     elif relation == "seen":
                         answer["seen"] = 1
                     elif relation in ("notseen", "unseen"):

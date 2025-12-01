@@ -181,7 +181,6 @@ class EvaluateAugmentedDataset:
         # if orig_map.keys() != stitched_map.keys():
         #     print( "Printing original: ", orig_map )
         #     print( "Printing stitched: ", stitched_map )
-        # --- 4️⃣ Compare movie-by-movie ---
         all_ids = set(orig_map.keys()) | set(stitched_map.keys())
 
         for mid in all_ids:
@@ -192,19 +191,29 @@ class EvaluateAugmentedDataset:
                 o = orig.get(f)
                 p = pred.get(f)
 
-                if o is not None and o < 2: # GT check
-                    res[f]["total"] += 1   # count it toward total GT labels
-                    if p is not None and p < 2: # both have labels, 2 means we don't have data so can't count our detections towards it
-                        if p == o: # check if the prediction matches what the GT is
+                # normalize None → 2 (unknown)
+                o = 2 if o is None else o
+                p = 2 if p is None else p
+
+                # Only evaluate GT values 0 and 1 for recall/accuracy
+                if o < 2:  
+                    res[f]["total"] += 1
+
+                    if p < 2:
+                        if p == o:
                             res[f]["tp"] += 1
                             res[f]["correct"] += 1
-                        else:                  # model got it wrong
+                        else:
                             res[f]["fn"] += 1
-
-                    else:        # model predicted a label that GT did not have → FP
+                            res[f]["fp"] += 1
+                    else:
+                        # Model predicted 2 when GT was 0/1 → that's a miss (FN)
                         res[f]["fn"] += 1
-                elif p is not None and p < 2:
+
+                # Count FP when model predicts 0/1 but GT = 2
+                elif o == 2 and p < 2:
                     res[f]["fp"] += 1
+
         return res
 
 
@@ -286,12 +295,12 @@ def print_results(metrics):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--original_snippets_dir", type=str, default="runs/Qwen3-0.6B_0shot/original_snippets",
+    parser.add_argument("--original_snippets_dir", type=str, default="runs/Qwen2.5-7B-Instruct_0shot/original_snippets",
                         help="Directory containing 1 file per original conversation in processing order.")
     parser.add_argument("--stitched_path", type=str,
-                        default="runs/Qwen3-0.6B_0shot/augmented_0.6B.json",
+                        default="runs/Qwen2.5-7B-Instruct_0shot/augmented_7B_0_shot.json",
                         help="Path to stitched augmented dataset JSON.")
-    parser.add_argument("--save_path", type=str, default=None,
+    parser.add_argument("--save_path", type=str, default="runs/Qwen2.5-7B-Instruct_0shot/evaluation_results_augmented7B.json",
                         help="Optional custom path to save results.")
 
     args = parser.parse_args()
