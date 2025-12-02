@@ -54,12 +54,19 @@ def query_wikidata_movies(limit: int = None) -> List[Dict[str, str]]:
             query = base_query + f" LIMIT {current_limit} OFFSET {offset}"
             print(f"Fetching movies {offset} to {offset + current_limit}...")
             
-            page_results = _execute_query(query)
-            if not page_results:
-                break
-            
-            movies.extend(page_results)
-            offset += len(page_results)
+            try:
+                page_results = _execute_query(query)
+                if not page_results:
+                    break
+                
+                movies.extend(page_results)
+                offset += len(page_results)
+            except Exception as e:
+                print(f"Error fetching page at offset {offset}: {e}")
+                print(f"Continuing with {len(movies)} movies collected so far...")
+                # Continue to next page instead of breaking completely
+                offset += current_limit
+                continue
             
             # If we got fewer results than requested, we've reached the end
             if len(page_results) < current_limit:
@@ -109,7 +116,23 @@ def _execute_query(query: str) -> List[Dict[str, str]]:
         response = requests.get(url, params=params, headers=headers, timeout=300)
         response.raise_for_status()
         
-        data = response.json()
+        # Try to parse JSON, handling potential encoding issues
+        try:
+            data = response.json()
+        except (ValueError, requests.exceptions.JSONDecodeError) as json_error:
+            # If JSON parsing fails, try to clean the response text
+            import json
+            import re
+            # Remove control characters that might cause issues (but keep newlines and tabs)
+            cleaned_text = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f-\x9f]', '', response.text)
+            try:
+                data = json.loads(cleaned_text)
+                print(f"Warning: Cleaned JSON response due to control characters")
+            except Exception as e:
+                print(f"Error: Could not parse JSON response even after cleaning. Error: {e}")
+                print(f"Original error: {json_error}")
+                print(f"Response length: {len(response.text)} characters")
+                raise
         
         movies = []
         bindings = data.get("results", {}).get("bindings", [])
