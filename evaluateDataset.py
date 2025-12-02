@@ -32,7 +32,7 @@ class EvaluateAugmentedDataset:
         # --- Load Original Dataset (Ground Truth) ---
         self.original_dataset = []
 
-        # 1️⃣ Try loading from original_snippets_dir if flag present
+        # Try loading from original_snippets_dir if flag present
         if self.args.original_snippets_dir:
             orig_dir = self.args.original_snippets_dir
             print(f"Loading original conversations for ground truth from directory: {orig_dir}")
@@ -77,7 +77,7 @@ class EvaluateAugmentedDataset:
             if len(self.original_dataset) > num_aug:
                 self.original_dataset = self.original_dataset[:num_aug]
 
-        # 2️⃣ Else try test_set.json
+        #  Else try test_set.json
         elif original_dataset_path:
             print(f"Loading original dataset from '{original_dataset_path}'...")
             with open(original_dataset_path, "r", encoding="utf-8") as f:
@@ -88,7 +88,7 @@ class EvaluateAugmentedDataset:
             with open("test_set.json", "r", encoding="utf-8") as f:
                 self.original_dataset = json.load(f)
 
-        # 3️⃣ Else fallback to full HF load
+        # Else fallback to full HF load
         else:
             print("WARNING: No comparison file found, loading FULL ReDial dataset from HuggingFace for ground truth...")
             redial = load_dataset("community-datasets/re_dial")
@@ -149,7 +149,7 @@ class EvaluateAugmentedDataset:
         if not isinstance(stitched_answers, list):
             stitched_answers = []
 
-        # --- 1️⃣ Build Ground Truth map (INCLUDES 2) ---
+        # --- Build Ground Truth map (INCLUDES 2) ---
         orig_map = {}
         stitched_map = {}
 
@@ -169,18 +169,12 @@ class EvaluateAugmentedDataset:
                     "suggested": a.get("suggested")
                 }
 
-        # --- 3️⃣ Initialize metric counters ---
+        # --- Initialize metric counters ---
         res = {
             "liked": {"tp": 0, "fp": 0, "fn": 0, "correct": 0, "total": 0},
             "seen": {"tp": 0, "fp": 0, "fn": 0, "correct": 0, "total": 0},
             "suggested": {"tp": 0, "fp": 0, "fn": 0, "correct": 0, "total": 0},
         }
-        # print( "Printing original: ", orig_map )
-        # print( "Printing stitched: ", stitched_map )
-
-        # if orig_map.keys() != stitched_map.keys():
-        #     print( "Printing original: ", orig_map )
-        #     print( "Printing stitched: ", stitched_map )
         all_ids = set(orig_map.keys()) | set(stitched_map.keys())
 
         for mid in all_ids:
@@ -191,7 +185,7 @@ class EvaluateAugmentedDataset:
                 o = orig.get(f)
                 p = pred.get(f)
 
-                # normalize None → 2 (unknown)
+                # normalize None to  2 (unknown)
                 o = 2 if o is None else o
                 p = 2 if p is None else p
 
@@ -243,17 +237,7 @@ class EvaluateAugmentedDataset:
                 for k in global_metrics[f]:
                     global_metrics[f][k] += r[f][k]
 
-        # for i in tqdm(range(n), desc="Evaluating Conversations"):
-        #     o = self.original_dataset[i]
-        #     print(curr_conv)
-        #     s = self.stitched_dataset[i]
-        #     print("o", o)
-        #     print("s", s)
-        #     r = self._compare_answers(self._extract_answers(o), self._extract_answers(s))
-        #     # print( r )
-        #     for f in ["liked", "seen", "suggested"]:
-        #         for k in global_metrics[f]:
-        #             global_metrics[f][k] += r[f][k]
+
 
         def sd(a, b): return round(a/b,4) if b else 0.0
         fm, otp, ofp, ofn, oc, ot = {}, 0,0,0,0,0
