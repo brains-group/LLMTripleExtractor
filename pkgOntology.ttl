@@ -1,0 +1,57 @@
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+@prefix pkg: <http://example.org/pkg-ontology/1.0#> .
+
+<http://example.org/pkg-ontology/1.0#> rdf:type owl:Ontology ;
+    rdfs:label "Personal Knowledge Graph Ontology for Conversational Recommendation" .
+
+# =================================================================
+# 1. CLASSES (ENTITIES)
+# =================================================================
+
+pkg:User rdf:type owl:Class ;
+    rdfs:label "User" ;
+    rdfs:comment "Represents the system user (the dialogue initiator) whose preferences are being tracked." .
+
+pkg:Movie rdf:type owl:Class ;
+    rdfs:label "Movie" ;
+    rdfs:comment "Represents a cinematic work, identified by its title or ID." .
+
+# =================================================================
+# 2. OBJECT PROPERTIES (RELATIONS / PREDICATES)
+# =================================================================
+
+# Domain and Range are User and Movie for all interaction properties.
+
+pkg:likes rdf:type owl:ObjectProperty ;
+    rdfs:label "likes" ;
+    rdfs:comment "The user explicitly stated a positive sentiment towards the movie (liked = 1)." ;
+    rdfs:domain pkg:User ;
+    rdfs:range pkg:Movie .
+
+pkg:dislikes rdf:type owl:ObjectProperty ;
+    rdfs:label "dislikes" ;
+    rdfs:comment "The user explicitly stated a negative sentiment towards the movie (liked = 0)." ;
+    rdfs:domain pkg:User ;
+    rdfs:range pkg:Movie .
+
+pkg:hasSeen rdf:type owl:ObjectProperty ;
+    rdfs:label "hasSeen" ;
+    rdfs:comment "The user has confirmed viewing the movie (seen = 1)." ;
+    rdfs:domain pkg:User ;
+    rdfs:range pkg:Movie .
+
+pkg:hasNotSeen rdf:type owl:ObjectProperty ;
+    rdfs:label "hasNotSeen" ;
+    rdfs:comment "The user has confirmed they have not viewed the movie (seen = 0)." ;
+    rdfs:domain pkg:User ;
+    rdfs:range pkg:Movie .
+
+pkg:wasSuggested rdf:type owl:ObjectProperty ;
+    rdfs:label "wasSuggested" ;
+    rdfs:comment "The movie was suggested to the user by the respondent (suggested = 1)." ;
+    rdfs:domain pkg:User ;
+    rdfs:range pkg:Movie .
