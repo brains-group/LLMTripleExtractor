@@ -1,4 +1,4 @@
-# LLm Triple Extractor Benchmark
+# LLM Triple Extractor Benchmark
 
 ## Wikidata Movie Data Extraction
 
