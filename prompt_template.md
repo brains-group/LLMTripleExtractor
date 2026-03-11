@@ -1,5 +1,3 @@
-# Prompt Templates
-
 ## Triple Extraction Prompt Template
 
 **Extract movie preferences from this conversation as triples.**
