@@ -56,7 +56,7 @@ Here is an example run:
 
 If using our framework, please consider citing our paper using the below bibtex style citation!
 
-'''bibtex
+'''
 @inproceedings{dasgupta2026from,
 title={{From “Strings” to “Things” for Personal
 Knowledge Graphs: Evaluating LLM Triple
