@@ -51,3 +51,19 @@ The results are printed to stdout, so I recommend sending it to a file.
 Here is an example run:
 
 `python test.py --base_model_path Qwen/Qwen3-8B --num_test_points 100 > Qwen3_8B.out`
+
+## Citation
+
+If using our framework, please consider citing our paper using the below bibtex style citation!
+
+'''bibtex
+@inproceedings{dasgupta2026from,
+title={{From “Strings” to “Things” for Personal
+Knowledge Graphs: Evaluating LLM Triple
+Extraction for Recommendation Systems}},
+author={Abhirup Dasgupta and Fernando Spadea and  and Seneviratne, Oshani},
+year = {2026},
+month = {05},
+booktitle = {LLM-TEXT2KG 2026 Workshop at ESWC 2026},
+}
+'''
