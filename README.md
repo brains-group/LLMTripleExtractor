@@ -54,7 +54,7 @@ Here is an example run:
 
 ## Citation
 
-If using our framework, please consider citing our paper using the below bibtex style citation!
+If using our framework, cite our paper using the below bibtex style citation!
 
 ```
 @inproceedings{dasgupta2026from,
