@@ -56,7 +56,7 @@ Here is an example run:
 
 If using our framework, please consider citing our paper using the below bibtex style citation!
 
-'''
+```
 @inproceedings{dasgupta2026from,
 title={{From “Strings” to “Things” for Personal
 Knowledge Graphs: Evaluating LLM Triple
@@ -66,4 +66,4 @@ year = {2026},
 month = {05},
 booktitle = {LLM-TEXT2KG 2026 Workshop at ESWC 2026},
 }
-'''
+```
